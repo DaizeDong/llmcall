@@ -7,9 +7,9 @@
 
 `call_chain` is a back-compat shim matching the legacy shim.call_chain (returns str|None).
 """
-from .core import DEFAULT_CHAIN, Attempt, Result, call
+from .core import DEFAULT_CHAIN, Attempt, Result, call, refine
 
-__all__ = ["call", "call_chain", "Result", "Attempt", "DEFAULT_CHAIN"]
+__all__ = ["call", "refine", "call_chain", "Result", "Attempt", "DEFAULT_CHAIN"]
 
 
 def call_chain(prompt, chain=None, providers=None, timeout=180, log=None):

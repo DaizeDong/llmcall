@@ -60,6 +60,7 @@ class Result:
     data: Any = None                     # validated object when schema= was given
     error: Optional[str] = None
     attempts: List[Attempt] = field(default_factory=list)
+    depth: int = 0                       # refinement passes taken (0 for a plain call)
 
     def __bool__(self) -> bool:
         return self.provider is not None
@@ -237,4 +238,74 @@ def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, timeout: float = 120.
     r.error = r.attempts[-1].error if r.attempts else "no provider available"
     if notify:
         _notify(notify, f"llmcall chain failed ({','.join(chain)}): {r.error}")
+    return r
+
+
+# ---- iterative deepening (opt-in) ----------------------------------------------------------------
+_JUDGE_SYS = (
+    "You are independently reviewing an answer produced for a task. Decide whether it is COMPLETE and "
+    "CORRECT, or whether one more pass would make it materially better. Reply EXACTLY 'DONE' if it is "
+    "good enough, or 'CONTINUE: <one concrete line on what to improve>'. Be strict about DONE: only "
+    "say CONTINUE when another pass would genuinely help, not for cosmetic wording."
+)
+
+
+def _self_judge(orig_prompt, answer, chain, timeout, model, effort):
+    """Independent review that decides done/continue. Runs on a ROTATED chain (a different provider
+    than most likely generated the answer) so it is not the generator grading itself. Returns the
+    verdict text ('DONE' / 'CONTINUE: ...') or None on failure (treated as DONE)."""
+    judge_chain = (list(chain[1:]) + list(chain[:1])) if len(chain) > 1 else list(chain)
+    jp = (f"{_JUDGE_SYS}\n\nTASK:\n{orig_prompt[:2000]}\n\nANSWER:\n{answer[:4000]}\n\nYour verdict:")
+    r = call(jp, chain=judge_chain, timeout=timeout, model=model, effort=effort)
+    return r.text.strip() if r else None
+
+
+def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, schema=None,
+           timeout: float = 120.0, model: Optional[str] = None, effort: Optional[str] = None,
+           notify: Optional[str] = None) -> Result:
+    """Iterative deepening: generate an answer, then decide from that answer whether to think harder,
+    up to max_depth further passes. Generalizes the "a single headless call cannot be course-corrected"
+    pattern into the primitive. Two judge modes:
+
+      judge=None (default self-refine): after each pass an INDEPENDENT model call (rotated chain)
+        reviews the answer and replies DONE or CONTINUE:<what to improve>; on CONTINUE the answer is
+        regenerated with that critique. Stops at DONE, at convergence (the answer stops changing), or
+        at max_depth.
+      judge=callable: judge(result, depth) -> str | None. Return a follow-up prompt to go deeper, or
+        None to accept the current result. Full control.
+
+    Returns the final Result (Result.depth = passes taken, Result.attempts spans them all). Never
+    raises; a total failure at any pass returns the best Result so far."""
+    r = call(prompt, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort)
+    attempts = list(r.attempts)
+    if not r:
+        r.attempts = attempts
+        if notify:
+            _notify(notify, f"llmcall refine: first pass failed: {r.error}")
+        return r
+    for depth in range(1, max(0, max_depth) + 1):
+        try:
+            if callable(judge):
+                nxt = judge(r, depth)
+                if not nxt:
+                    break
+                r2 = call(nxt, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort)
+            else:
+                verdict = _self_judge(prompt, r.text, chain, timeout, model, effort)
+                if verdict is None or verdict.upper().startswith("DONE"):
+                    break
+                improve = (f"{prompt}\n\nYour previous answer:\n{r.text}\n\nAn independent reviewer says "
+                           f"it can be improved:\n{verdict}\n\nProduce a better, complete answer.")
+                r2 = call(improve, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort)
+        except Exception:
+            break
+        if not r2:
+            break
+        attempts += r2.attempts
+        converged = r2.text.strip() == r.text.strip()
+        r = r2
+        r.depth = depth
+        if converged:
+            break
+    r.attempts = attempts
     return r

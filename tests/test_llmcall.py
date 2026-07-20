@@ -208,3 +208,52 @@ def test_call_chain_returns_str_or_none(monkeypatch):
 def test_real_codex_smoke():
     r = call("Reply with only the word PONG.", chain=["codex"], timeout=90)
     assert r and "PONG" in r.text.upper()
+
+
+# ---- refine (iterative deepening) ----------------------------------------------------------------
+from llmcall import refine  # noqa: E402
+
+
+def test_refine_callable_recurses_then_stops(monkeypatch):
+    outs = iter([("first", None), ("second", None)])
+    monkeypatch.setattr(core, "_invoke", lambda *a: next(outs))
+    seen = []
+
+    def judge(r, depth):
+        seen.append(depth)
+        return "go deeper" if depth == 1 else None
+    r = refine("start", judge=judge, max_depth=3)
+    assert r.text == "second" and r.depth == 1 and seen == [1, 2]
+
+
+def test_refine_self_refine_continue_then_done(monkeypatch):
+    seq = iter([("draft1", None), ("CONTINUE: add X", None), ("draft2", None), ("DONE", None)])
+    monkeypatch.setattr(core, "_invoke", lambda *a: next(seq))
+    r = refine("task", max_depth=3)
+    assert r.text == "draft2" and r.depth == 1
+
+
+def test_refine_convergence_stops(monkeypatch):
+    seq = iter([("same", None), ("CONTINUE: x", None), ("same", None)])
+    monkeypatch.setattr(core, "_invoke", lambda *a: next(seq))
+    r = refine("task", max_depth=5)
+    assert r.text == "same" and r.depth == 1  # regenerate returned the same text -> converged
+
+
+def test_refine_max_depth_cap(monkeypatch):
+    counter = {"n": 0}
+
+    def fake(name, prompt, timeout, model, effort):
+        if "Your verdict:" in prompt:
+            return ("CONTINUE: more", None)
+        counter["n"] += 1
+        return (f"draft{counter['n']}", None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = refine("task", max_depth=2)
+    assert r.depth == 2  # never exceeds max_depth even when the judge keeps saying CONTINUE
+
+
+def test_refine_first_pass_failure_is_falsy(monkeypatch):
+    monkeypatch.setattr(core, "_invoke", lambda *a: (None, "down"))
+    r = refine("task")
+    assert not r and r.depth == 0
