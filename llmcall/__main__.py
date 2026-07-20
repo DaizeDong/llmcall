@@ -2,8 +2,10 @@
 stdout, exit 0 if a provider answered else 1.
 
   echo "..." | python -m llmcall [--chain codex,cc,claude] [--schema f.json] [--timeout 120] \
-                                 [--model M] [--effort E] [--notify STREAM]
+                                 [--model M] [--effort E] [--notify STREAM] [--web-search]
 
+--chain also accepts `gemini` (the search-grounded Gemini CLI), e.g. --chain gemini.
+--web-search opts into the network search tool (off by default; relaxes read-only).
 With --schema, stdout is the validated JSON object; otherwise stdout is the raw text.
 """
 from __future__ import annotations
@@ -23,6 +25,8 @@ def main() -> int:
     ap.add_argument("--model", default=None)
     ap.add_argument("--effort", default=None)
     ap.add_argument("--notify", default=None, help="the relay project stream to alert on total failure")
+    ap.add_argument("--web-search", dest="web_search", action="store_true",
+                    help="opt into the network search tool (off by default; relaxes read-only)")
     a = ap.parse_args()
 
     schema = None
@@ -31,7 +35,8 @@ def main() -> int:
             schema = json.load(f)
     prompt = sys.stdin.read()
     r = call(prompt, chain=[c.strip() for c in a.chain.split(",") if c.strip()],
-             schema=schema, timeout=a.timeout, model=a.model, effort=a.effort, notify=a.notify)
+             schema=schema, timeout=a.timeout, model=a.model, effort=a.effort, notify=a.notify,
+             web_search=a.web_search)
     if not r:
         sys.stderr.write((r.error or "chain failed") + "\n")
         return 1

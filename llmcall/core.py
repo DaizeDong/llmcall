@@ -6,6 +6,13 @@ One place solves every headless footgun the fleet re-solved 3-4 times: no-window
 (else ~26 MCP servers load and hang the one-shot). Read-only by construction: codex runs `-s
 read-only` and cc/claude run with MCP disabled, so a judgment call can never be handed a tool.
 
+Two opt-in extensions widen this without changing the default:
+- `chain=["gemini"]` routes to the Gemini CLI (search-grounded, for discovery diversity); gemini is
+  never in the default chain.
+- `web_search=True` is an explicit relaxation of the read-only default: it grants the network search
+  tool (codex web_search; cc/claude built-in WebSearch/WebFetch) while codex stays FS-read-only. It is
+  a research call, off by default, never implied.
+
 `call()` NEVER raises: any provider failure is caught and the chain moves on; total failure returns a
 falsy Result. Pure stdlib.
 """
@@ -33,6 +40,8 @@ _CODEX_PATHS = [os.path.expanduser(r"~/AppData/Roaming/npm/codex.cmd"),
 _CC_PATHS = [os.path.expanduser(r"~/.local/bin/cc.cmd"), os.path.expanduser(r"~/.local/bin/cc")]
 _CLAUDE_PATHS = [os.path.expanduser(r"~/.local/bin/claude.exe"),
                  os.path.expanduser(r"~/.local/bin/claude")]
+_GEMINI_PATHS = [os.path.expanduser(r"~/AppData/Roaming/npm/gemini.cmd"),
+                 os.path.expanduser(r"~/AppData/Roaming/npm/gemini")]
 
 # Disabling MCP is mandatory for a headless one-shot: both Claude Code CLIs otherwise load every
 # configured MCP server and hang after the work is done, running out the time limit -> empty answer.
@@ -41,6 +50,12 @@ _NO_MCP = ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}')
 _CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 _CODEX_FALLBACK_EFFORT = "max"
 _CLAUDE_FALLBACK_MODEL = "claude-opus-4-8"
+_GEMINI_FALLBACK_MODEL = "gemini-3-pro-preview"
+
+# Opt-in web tools. web_search=True relaxes the read-only default: codex gains the web_search tool
+# (still FS-read-only), cc/claude gain the built-in WebSearch/WebFetch (which work with MCP disabled).
+# gemini is search-grounded by design, so it needs no extra flag. Never on by default.
+_CC_WEB_TOOLS = ("--allowedTools", "WebSearch", "WebFetch")
 
 
 @dataclass
@@ -113,6 +128,8 @@ def _resolve_model(kind: str, model: Optional[str], effort: Optional[str]) -> Tu
         cfg = _codex_config()
         return (model or cfg.get("model") or _CODEX_FALLBACK_MODEL,
                 effort or cfg.get("model_reasoning_effort") or _CODEX_FALLBACK_EFFORT)
+    if kind == "gemini":
+        return model or _GEMINI_FALLBACK_MODEL, None
     return model or _CLAUDE_FALLBACK_MODEL, None
 
 
@@ -130,7 +147,7 @@ def _unwrap_envelope(stdout: str) -> str:
 
 
 # ---- providers: each returns (text|None, error|None) ---------------------------------------------
-def _codex(prompt, timeout, model, effort):
+def _codex(prompt, timeout, model, effort, web_search=False):
     binp = _find("codex", _CODEX_PATHS)
     if not binp:
         return None, "codex not found"
@@ -138,9 +155,11 @@ def _codex(prompt, timeout, model, effort):
     fd, outpath = tempfile.mkstemp(prefix="llmcall_codex_", suffix=".txt")
     os.close(fd)
     try:
+        # web_search stays FS-read-only (-s read-only): it adds the network search tool only.
+        extra = ("-c", "tools.web_search=true") if web_search else ()
         cmd = _argv(binp, "exec", "-m", m, "-c", f"model_reasoning_effort={eff}",
                     "-s", "read-only", "--skip-git-repo-check", "--ephemeral",
-                    "-c", "mcp_servers={}", "--color", "never", "-o", outpath, "-")
+                    "-c", "mcp_servers={}", *extra, "--color", "never", "-o", outpath, "-")
         stdout, err = _run(cmd, prompt, timeout)
         if stdout is None:
             return None, err
@@ -156,30 +175,50 @@ def _codex(prompt, timeout, model, effort):
             pass
 
 
-def _claude_family(name, paths, prompt, timeout, model):
+def _claude_family(name, paths, prompt, timeout, model, web_search=False):
     binp = _find(name, paths)
     if not binp:
         return None, f"{name} not found"
     m, _ = _resolve_model("claude", model, None)
-    stdout, err = _run(_argv(binp, "-p", "--model", m, "--output-format", "json", *_NO_MCP),
+    # WebSearch/WebFetch are built-in Claude Code tools; they work with MCP disabled.
+    tools = _CC_WEB_TOOLS if web_search else ()
+    stdout, err = _run(_argv(binp, "-p", "--model", m, "--output-format", "json", *_NO_MCP, *tools),
                        prompt, timeout)
     if stdout is None:
         return None, err
     return _unwrap_envelope(stdout), None
 
 
-def _invoke(name, prompt, timeout, model, effort):
+def _gemini(prompt, timeout, model):
+    """Gemini via the gemini-cli one-shot (`gemini -m <model> -p <prompt>`). Search-grounded by design,
+    so web_search needs no extra flag. Reached as an EXCLUSIVE provider (chain=["gemini"]) for discovery
+    diversity, never in the default codex->cc->claude chain. If gemini-cli is not installed it returns a
+    not-found error and the chain moves on, exactly like any other missing provider."""
+    binp = _find("gemini", _GEMINI_PATHS)
+    if not binp:
+        return None, "gemini not found"
+    m, _ = _resolve_model("gemini", model, None)
+    # gemini-cli takes the prompt as the -p argument (no stdin); output is plain text (no JSON envelope).
+    stdout, err = _run(_argv(binp, "-m", m, "-p", prompt), "", timeout)
+    if stdout is None:
+        return None, err
+    return stdout, None
+
+
+def _invoke(name, prompt, timeout, model, effort, web_search=False):
     if name == "codex":
-        return _codex(prompt, timeout, model, effort)
+        return _codex(prompt, timeout, model, effort, web_search)
     if name == "cc":
-        return _claude_family("cc", _CC_PATHS, prompt, timeout, model)
+        return _claude_family("cc", _CC_PATHS, prompt, timeout, model, web_search)
     if name == "claude":
-        return _claude_family("claude", _CLAUDE_PATHS, prompt, timeout, model)
+        return _claude_family("claude", _CLAUDE_PATHS, prompt, timeout, model, web_search)
+    if name == "gemini":
+        return _gemini(prompt, timeout, model)
     return None, f"unknown provider {name}"
 
 
 # ---- optional layers -----------------------------------------------------------------------------
-def _validate_or_retry(name, prompt, text, schema, timeout, model, effort):
+def _validate_or_retry(name, prompt, text, schema, timeout, model, effort, web_search=False):
     """Return (data, error). Extract+validate the JSON; on failure retry the SAME provider once with a
     nudge (a per-provider self-correction) before the caller falls through to the next provider."""
     obj = extract_json(text)
@@ -188,7 +227,7 @@ def _validate_or_retry(name, prompt, text, schema, timeout, model, effort):
         if ok:
             return obj, None
     nudge = prompt + "\n\nReturn ONLY valid JSON matching the required shape. No prose, no markdown."
-    raw, err = _invoke(name, nudge, timeout, model, effort)
+    raw, err = _invoke(name, nudge, timeout, model, effort, web_search)
     obj = extract_json((raw or "").strip())
     if obj is not None:
         ok, e = validate(obj, schema)
@@ -212,18 +251,23 @@ def _notify(stream: str, msg: str) -> None:
 # ---- the chain -----------------------------------------------------------------------------------
 def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, timeout: float = 120.0,
          model: Optional[str] = None, effort: Optional[str] = None,
-         notify: Optional[str] = None) -> Result:
+         notify: Optional[str] = None, web_search: bool = False) -> Result:
     """Try providers in `chain` order; the first non-empty (and, with schema=, schema-valid) answer
-    wins. Never raises. Returns a Result (falsy if the whole chain failed)."""
+    wins. Never raises. Returns a Result (falsy if the whole chain failed).
+
+    web_search=False (default) keeps the read-only-by-construction guarantee. web_search=True is an
+    explicit opt-in that grants the network search tool (codex web_search; cc/claude WebSearch+WebFetch;
+    gemini is search-grounded already) while codex stays FS-read-only -- a research call, not a plain
+    judgment. Never turn it on unless the task genuinely needs to look something up on the web."""
     r = Result()
     for name in chain:
         t0 = time.time()
         data = None
         try:
-            raw, err = _invoke(name, prompt, timeout, model, effort)
+            raw, err = _invoke(name, prompt, timeout, model, effort, web_search)
             text = (raw or "").strip()
             if text and schema is not None:
-                data, verr = _validate_or_retry(name, prompt, text, schema, timeout, model, effort)
+                data, verr = _validate_or_retry(name, prompt, text, schema, timeout, model, effort, web_search)
                 if data is None:
                     text, err = "", verr  # schema-invalid counts as a provider miss
         except Exception as e:  # the never-raises guarantee: a provider bug cannot escape the chain
@@ -262,7 +306,7 @@ def _self_judge(orig_prompt, answer, chain, timeout, model, effort):
 
 def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, schema=None,
            timeout: float = 120.0, model: Optional[str] = None, effort: Optional[str] = None,
-           notify: Optional[str] = None) -> Result:
+           notify: Optional[str] = None, web_search: bool = False) -> Result:
     """Iterative deepening: generate an answer, then decide from that answer whether to think harder,
     up to max_depth further passes. Generalizes the "a single headless call cannot be course-corrected"
     pattern into the primitive. Two judge modes:
@@ -276,7 +320,7 @@ def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, 
 
     Returns the final Result (Result.depth = passes taken, Result.attempts spans them all). Never
     raises; a total failure at any pass returns the best Result so far."""
-    r = call(prompt, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort)
+    r = call(prompt, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort, web_search=web_search)
     attempts = list(r.attempts)
     if not r:
         r.attempts = attempts
@@ -289,14 +333,14 @@ def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, 
                 nxt = judge(r, depth)
                 if not nxt:
                     break
-                r2 = call(nxt, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort)
+                r2 = call(nxt, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort, web_search=web_search)
             else:
                 verdict = _self_judge(prompt, r.text, chain, timeout, model, effort)
                 if verdict is None or verdict.upper().startswith("DONE"):
                     break
                 improve = (f"{prompt}\n\nYour previous answer:\n{r.text}\n\nAn independent reviewer says "
                            f"it can be improved:\n{verdict}\n\nProduce a better, complete answer.")
-                r2 = call(improve, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort)
+                r2 = call(improve, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort, web_search=web_search)
         except Exception:
             break
         if not r2:

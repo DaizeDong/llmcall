@@ -15,7 +15,7 @@ from llmcall.schema import extract_json, validate
 def _fixed(mapping):
     calls = []
 
-    def fake(name, prompt, timeout, model, effort):
+    def fake(name, prompt, timeout, model, effort, web_search=False):
         calls.append(name)
         return mapping.get(name, (None, "not configured"))
     return fake, calls
@@ -25,7 +25,7 @@ def _scripted(scripts):
     calls = []
     iters = {k: iter(v) for k, v in scripts.items()}
 
-    def fake(name, prompt, timeout, model, effort):
+    def fake(name, prompt, timeout, model, effort, web_search=False):
         calls.append(name)
         return next(iters[name])
     return fake, calls
@@ -121,7 +121,7 @@ def test_schema_exhausted_falls_through(monkeypatch):
 
 # ---- never raises --------------------------------------------------------------------------------
 def test_never_raises_even_if_provider_throws(monkeypatch):
-    def boom(name, prompt, timeout, model, effort):
+    def boom(name, prompt, timeout, model, effort, web_search=False):
         raise RuntimeError("provider blew up")
     monkeypatch.setattr(core, "_invoke", boom)
     r = call("x")  # must not raise
@@ -165,6 +165,93 @@ def test_missing_binary_is_a_clean_miss(monkeypatch):
     monkeypatch.setattr(core, "_find", lambda n, c: None)
     text, err = core._invoke("cc", "p", 10, None, None)
     assert text is None and "not found" in err
+
+
+# ---- gemini provider -----------------------------------------------------------------------------
+def test_gemini_argv_and_plain_text(monkeypatch):
+    cap = {}
+
+    def fake_run(cmd, input=None, **kw):
+        cap["cmd"] = cmd
+        cap["stdin"] = input
+        return subprocess.CompletedProcess(cmd, 0, stdout="gemini plain answer", stderr="")
+    monkeypatch.setattr(core, "_find", lambda n, c: "/x/gemini.cmd")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    text, err = core._invoke("gemini", "the prompt", 10, None, None)
+    assert text == "gemini plain answer" and err is None            # plain text, no JSON envelope unwrap
+    assert "-m" in cap["cmd"] and core._GEMINI_FALLBACK_MODEL in cap["cmd"]
+    assert "-p" in cap["cmd"] and "the prompt" in cap["cmd"]         # prompt is the -p arg
+    assert cap["stdin"] == ""                                        # not stdin
+
+
+def test_gemini_missing_is_a_clean_miss(monkeypatch):
+    monkeypatch.setattr(core, "_find", lambda n, c: None)
+    text, err = core._invoke("gemini", "p", 10, None, None)
+    assert text is None and "gemini not found" in err
+
+
+def test_gemini_model_resolution():
+    assert core._resolve_model("gemini", None, None) == (core._GEMINI_FALLBACK_MODEL, None)
+    assert core._resolve_model("gemini", "gemini-3-flash-preview", None) == ("gemini-3-flash-preview", None)
+
+
+def test_gemini_exclusive_chain(monkeypatch):
+    fake, calls = _fixed({"gemini": ("g", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = call("x", chain=["gemini"])
+    assert r.provider == "gemini" and r.text == "g" and calls == ["gemini"]
+
+
+# ---- web_search opt-in (off by default; relaxes read-only) ---------------------------------------
+def _capture_cmd(monkeypatch, stdout="ok"):
+    cap = {}
+
+    def fake_run(cmd, input=None, **kw):
+        cap["cmd"] = cmd
+        if "-o" in cmd:  # codex writes to the outfile
+            with open(cmd[cmd.index("-o") + 1], "w", encoding="utf-8") as f:
+                f.write("codex answer")
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+    monkeypatch.setattr(core, "_find", lambda n, c: "/x/bin")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return cap
+
+
+def test_codex_no_web_search_by_default(monkeypatch):
+    cap = _capture_cmd(monkeypatch)
+    core._invoke("codex", "p", 10, None, None)                       # web_search defaults False
+    assert "tools.web_search=true" not in " ".join(cap["cmd"])
+    assert "read-only" in cap["cmd"]                                 # still read-only
+
+
+def test_codex_web_search_opt_in(monkeypatch):
+    cap = _capture_cmd(monkeypatch)
+    core._invoke("codex", "p", 10, None, None, True)                 # web_search=True
+    joined = " ".join(cap["cmd"])
+    assert "tools.web_search=true" in joined
+    assert "read-only" in cap["cmd"]                                 # FS still read-only
+
+
+def test_cc_web_tools_only_when_opted_in(monkeypatch):
+    cap = _capture_cmd(monkeypatch, stdout=json.dumps({"result": "x"}))
+    core._invoke("cc", "p", 10, None, None)                          # default: no web tools
+    assert "--allowedTools" not in cap["cmd"]
+    cap2 = _capture_cmd(monkeypatch, stdout=json.dumps({"result": "x"}))
+    core._invoke("cc", "p", 10, None, None, True)                    # opted in
+    assert "--allowedTools" in cap2["cmd"] and "WebSearch" in cap2["cmd"] and "WebFetch" in cap2["cmd"]
+
+
+def test_web_search_threads_through_call(monkeypatch):
+    seen = {}
+
+    def fake(name, prompt, timeout, model, effort, web_search=False):
+        seen[name] = web_search
+        return ("ok", None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("x", web_search=True)
+    assert seen["codex"] is True
+    call("y")  # default
+    assert seen["codex"] is False
 
 
 # ---- model/effort resolution ---------------------------------------------------------------------
@@ -243,7 +330,7 @@ def test_refine_convergence_stops(monkeypatch):
 def test_refine_max_depth_cap(monkeypatch):
     counter = {"n": 0}
 
-    def fake(name, prompt, timeout, model, effort):
+    def fake(name, prompt, timeout, model, effort, web_search=False):
         if "Your verdict:" in prompt:
             return ("CONTINUE: more", None)
         counter["n"] += 1
