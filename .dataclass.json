@@ -1,0 +1,14 @@
+{
+  "_comment": [
+    "Skill Repo Spec v1 s9 -- every path in this repo belongs to exactly one class.",
+    "TOOL    = code, README, docs. Public.",
+    "FIXTURE = lifelike test data, must be produced by tools/make_fixtures.py.",
+    "DATA    = anything a real run produced. Never git-tracked; resolved out-of-repo by tools/datadir.py.",
+    "data_sealed = a path that HELD real data, was purged, and must stay dead.",
+    "Enforced by tools/data_boundary.py in .githooks and CI."
+  ],
+  "_audited": "2026-07-20 -- llmcall is a pure-stdlib codex->cc->claude call primitive. It produces NO real-run data: the only writes are ephemeral mkstemp tempfiles for codex stdin/stdout (in the OS temp dir, unlinked after use), never inside the repo. Tests use only synthetic placeholders (user1@example.com etc.). No DATA-class path, no FIXTURE. Empty lists here are a CONCLUSION (audited, nothing to declare), not a default.",
+  "data": [],
+  "data_sealed": [],
+  "fixture": []
+}
