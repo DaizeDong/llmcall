@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmcall"
+version = "0.1.0"
+description = "One primitive for headless codex -> cc -> claude text-judgment calls"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "DaizeDong" }]
+keywords = ["llm", "codex", "claude", "fallback-chain", "headless"]
+dependencies = []
+
+[project.scripts]
+llmcall = "llmcall.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["llmcall*"]
