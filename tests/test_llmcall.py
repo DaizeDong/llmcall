@@ -15,7 +15,7 @@ from llmcall.schema import extract_json, validate
 def _fixed(mapping):
     calls = []
 
-    def fake(name, prompt, timeout, model, effort, web_search=False):
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
         calls.append(name)
         return mapping.get(name, (None, "not configured"))
     return fake, calls
@@ -25,7 +25,7 @@ def _scripted(scripts):
     calls = []
     iters = {k: iter(v) for k, v in scripts.items()}
 
-    def fake(name, prompt, timeout, model, effort, web_search=False):
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
         calls.append(name)
         return next(iters[name])
     return fake, calls
@@ -121,7 +121,7 @@ def test_schema_exhausted_falls_through(monkeypatch):
 
 # ---- never raises --------------------------------------------------------------------------------
 def test_never_raises_even_if_provider_throws(monkeypatch):
-    def boom(name, prompt, timeout, model, effort, web_search=False):
+    def boom(name, prompt, timeout, model, effort, web_search=False, agentic=False):
         raise RuntimeError("provider blew up")
     monkeypatch.setattr(core, "_invoke", boom)
     r = call("x")  # must not raise
@@ -244,14 +244,121 @@ def test_cc_web_tools_only_when_opted_in(monkeypatch):
 def test_web_search_threads_through_call(monkeypatch):
     seen = {}
 
-    def fake(name, prompt, timeout, model, effort, web_search=False):
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
         seen[name] = web_search
         return ("ok", None)
     monkeypatch.setattr(core, "_invoke", fake)
     call("x", web_search=True)
     assert seen["codex"] is True
-    call("y")  # default
+    call("y")  # default (web_search=None -> mode=judge -> no web)
     assert seen["codex"] is False
+
+
+# ---- hardened extract_json (balanced-brace, first complete) --------------------------------------
+def test_extract_json_first_complete_and_string_aware():
+    assert extract_json("prose {\"a\": 1} tail") == {"a": 1}
+    assert extract_json("[1, 2, 3]") == [1, 2, 3]
+    assert extract_json('{"s": "a brace } inside a string"}') == {"s": "a brace } inside a string"}
+    # two objects: the greedy \{.*\} regex over-captured both and json.loads FAILED -> None; the
+    # balanced scanner returns the FIRST complete one (strict improvement).
+    assert extract_json('{"a":1}\n{"b":2}') == {"a": 1}
+    assert extract_json("no json here") is None
+
+
+# ---- extract= hook (general form of schema=) -----------------------------------------------------
+def test_extract_hook_returns_data(monkeypatch):
+    fake, _ = _fixed({"codex": ("the answer is 42 somewhere", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = call("x", extract=lambda t: {"n": 42} if "42" in t else None)
+    assert r.data == {"n": 42} and r.provider == "codex"
+
+
+def test_extract_hook_miss_retries_then_falls_through(monkeypatch):
+    fake, calls = _scripted({"codex": [("nope", None), ("still nope", None)], "cc": [("has KEY", None)]})
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = call("x", extract=lambda t: {"ok": 1} if "KEY" in t else None, chain=["codex", "cc"])
+    assert r.provider == "cc" and r.data == {"ok": 1}
+    assert calls == ["codex", "codex", "cc"]  # same-provider retry, then fall through (fixes furry's gap)
+
+
+def test_extract_hook_that_throws_is_a_miss_not_an_escape(monkeypatch):
+    fake, _ = _fixed({"codex": ("x", None), "cc": ("x", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+
+    def boom(t):
+        raise ValueError("bad extractor")
+    r = call("x", extract=boom, chain=["codex", "cc"])  # must not raise
+    assert not r  # a throwing extractor counts as a miss on every attempt; chain exhausts, never escapes
+
+
+# ---- mode= tiers ---------------------------------------------------------------------------------
+def test_mode_research_turns_on_web(monkeypatch):
+    seen = {}
+
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        seen["web"], seen["agentic"] = web_search, agentic
+        return ("ok", None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("x", mode="research")
+    assert seen["web"] is True and seen["agentic"] is False
+
+
+def test_mode_agent_sets_agentic(monkeypatch):
+    seen = {}
+
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        seen["agentic"] = agentic
+        return ("ok", None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("x", mode="agent")
+    assert seen["agentic"] is True
+
+
+def test_web_search_overrides_mode(monkeypatch):
+    seen = {}
+
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        seen["web"] = web_search
+        return ("ok", None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("x", mode="research", web_search=False)
+    assert seen["web"] is False  # explicit False forces off even in research
+    call("x", mode="judge", web_search=True)
+    assert seen["web"] is True   # explicit True forces on even in judge
+
+
+def test_codex_agent_uses_workspace_write(monkeypatch):
+    cap = _capture_cmd(monkeypatch)
+    core._invoke("codex", "p", 10, None, None, False, True)  # agentic=True
+    assert "workspace-write" in cap["cmd"] and "read-only" not in cap["cmd"]
+
+
+def test_codex_judge_stays_read_only(monkeypatch):
+    cap = _capture_cmd(monkeypatch)
+    core._invoke("codex", "p", 10, None, None)  # defaults
+    assert "read-only" in cap["cmd"] and "workspace-write" not in cap["cmd"]
+
+
+def test_cc_agent_delegates_to_runner(monkeypatch):
+    cap = {}
+
+    def fake_run(cmd, input=None, **kw):
+        cap["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"result": "agent answer"}), stderr="")
+    monkeypatch.setattr(core.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    text, err = core._invoke("cc", "p", 10, None, None, False, True)  # agentic=True
+    assert text == "agent answer" and err is None
+    assert any("agent-runner" in str(c) for c in cap["cmd"]) and "-Capture" in cap["cmd"]
+
+
+# ---- log= callback -------------------------------------------------------------------------------
+def test_log_callback_per_attempt(monkeypatch):
+    fake, _ = _fixed({"codex": (None, "down"), "cc": ("hi", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    lines = []
+    call("x", log=lines.append)
+    assert any("codex: unavailable" in l for l in lines) and any("cc: answered" in l for l in lines)
 
 
 # ---- model/effort resolution ---------------------------------------------------------------------
@@ -330,7 +437,7 @@ def test_refine_convergence_stops(monkeypatch):
 def test_refine_max_depth_cap(monkeypatch):
     counter = {"n": 0}
 
-    def fake(name, prompt, timeout, model, effort, web_search=False):
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
         if "Your verdict:" in prompt:
             return ("CONTINUE: more", None)
         counter["n"] += 1

@@ -57,6 +57,13 @@ _GEMINI_FALLBACK_MODEL = "gemini-3-pro-preview"
 # gemini is search-grounded by design, so it needs no extra flag. Never on by default.
 _CC_WEB_TOOLS = ("--allowedTools", "WebSearch", "WebFetch")
 
+# Capability tiers. mode="judge" (default) = read-only judgment (all footguns above). mode="research" =
+# judge + the network search tool (== web_search=True). mode="agent" = full agency, provider-split:
+# codex flips its sandbox to workspace-write in-process; cc/claude DELEGATE to the agent runner (the resilient
+# full-session skill runner) rather than growing an agentic runner inside the judgment primitive.
+_MODES = ("judge", "research", "agent")
+_RUN_CLAUDE_AGENT = os.path.expanduser(r"the agent runner")
+
 
 @dataclass
 class Attempt:
@@ -147,7 +154,7 @@ def _unwrap_envelope(stdout: str) -> str:
 
 
 # ---- providers: each returns (text|None, error|None) ---------------------------------------------
-def _codex(prompt, timeout, model, effort, web_search=False):
+def _codex(prompt, timeout, model, effort, web_search=False, agentic=False):
     binp = _find("codex", _CODEX_PATHS)
     if not binp:
         return None, "codex not found"
@@ -155,10 +162,13 @@ def _codex(prompt, timeout, model, effort, web_search=False):
     fd, outpath = tempfile.mkstemp(prefix="llmcall_codex_", suffix=".txt")
     os.close(fd)
     try:
-        # web_search stays FS-read-only (-s read-only): it adds the network search tool only.
+        # mode="agent" flips the sandbox to workspace-write (FS write + full shell); judge/research stay
+        # read-only. web_search is ORTHOGONAL (adds the network tool at either sandbox level), so an
+        # FS-write agent gets the network only if the caller also asked for it.
+        sandbox = "workspace-write" if agentic else "read-only"
         extra = ("-c", "tools.web_search=true") if web_search else ()
         cmd = _argv(binp, "exec", "-m", m, "-c", f"model_reasoning_effort={eff}",
-                    "-s", "read-only", "--skip-git-repo-check", "--ephemeral",
+                    "-s", sandbox, "--skip-git-repo-check", "--ephemeral",
                     "-c", "mcp_servers={}", *extra, "--color", "never", "-o", outpath, "-")
         stdout, err = _run(cmd, prompt, timeout)
         if stdout is None:
@@ -175,7 +185,9 @@ def _codex(prompt, timeout, model, effort, web_search=False):
             pass
 
 
-def _claude_family(name, paths, prompt, timeout, model, web_search=False):
+def _claude_family(name, paths, prompt, timeout, model, web_search=False, agentic=False):
+    if agentic:
+        return _claude_agent(prompt, timeout)
     binp = _find(name, paths)
     if not binp:
         return None, f"{name} not found"
@@ -187,6 +199,29 @@ def _claude_family(name, paths, prompt, timeout, model, web_search=False):
     if stdout is None:
         return None, err
     return _unwrap_envelope(stdout), None
+
+
+def _claude_agent(prompt, timeout):
+    """mode="agent" for cc/claude DELEGATES to the agent runner (agent-runner -Capture): it reuses that
+    runner's resilient cc -> claude-direct transport (gateway-unset fallback) and full-session tool
+    access, and returns the final answer on stdout. Never used on untrusted input; never the default;
+    codex has NO the agent runner home (it cannot run Claude Code skills) so its agent path stays in-process."""
+    if not os.path.isfile(_RUN_CLAUDE_AGENT):
+        return None, "agent-runner not found (mode='agent' delegate unavailable)"
+    fd, logpath = tempfile.mkstemp(prefix="llmcall_agent_", suffix=".log")
+    os.close(fd)
+    try:
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _RUN_CLAUDE_AGENT,
+               "-Prompt", prompt, "-Log", logpath, "-Capture"]
+        stdout, err = _run(cmd, "", timeout)
+        if stdout is None:
+            return None, err
+        return _unwrap_envelope(stdout.strip()), None
+    finally:
+        try:
+            os.remove(logpath)
+        except OSError:
+            pass
 
 
 def _gemini(prompt, timeout, model):
@@ -205,36 +240,48 @@ def _gemini(prompt, timeout, model):
     return stdout, None
 
 
-def _invoke(name, prompt, timeout, model, effort, web_search=False):
+def _invoke(name, prompt, timeout, model, effort, web_search=False, agentic=False):
     if name == "codex":
-        return _codex(prompt, timeout, model, effort, web_search)
+        return _codex(prompt, timeout, model, effort, web_search, agentic)
     if name == "cc":
-        return _claude_family("cc", _CC_PATHS, prompt, timeout, model, web_search)
+        return _claude_family("cc", _CC_PATHS, prompt, timeout, model, web_search, agentic)
     if name == "claude":
-        return _claude_family("claude", _CLAUDE_PATHS, prompt, timeout, model, web_search)
+        return _claude_family("claude", _CLAUDE_PATHS, prompt, timeout, model, web_search, agentic)
     if name == "gemini":
         return _gemini(prompt, timeout, model)
     return None, f"unknown provider {name}"
 
 
 # ---- optional layers -----------------------------------------------------------------------------
-def _validate_or_retry(name, prompt, text, schema, timeout, model, effort, web_search=False):
-    """Return (data, error). Extract+validate the JSON; on failure retry the SAME provider once with a
-    nudge (a per-provider self-correction) before the caller falls through to the next provider."""
+def _apply(text, schema, extract):
+    """Turn provider text into (obj, ok). extract= (a caller callable) WINS over schema=; a throwing
+    extractor counts as a miss, never an escape (preserves never-raises). A None result = miss."""
+    if extract is not None:
+        try:
+            obj = extract(text)
+        except Exception:
+            obj = None
+        return obj, (obj is not None)
     obj = extract_json(text)
-    if obj is not None:
-        ok, _ = validate(obj, schema)
-        if ok:
-            return obj, None
+    if obj is None:
+        return None, False
+    ok, _ = validate(obj, schema)
+    return (obj if ok else None), ok
+
+
+def _extract_or_retry(name, prompt, text, schema, extract, timeout, model, effort, web_search, agentic):
+    """Return (data, error). Apply schema=/extract= to the text; on a miss retry the SAME provider once
+    with a nudge (per-provider self-correction) before the caller falls through to the next provider.
+    This is the general form of the old schema-only path: schema= is _apply's extract_json+validate."""
+    obj, ok = _apply(text, schema, extract)
+    if ok:
+        return obj, None
     nudge = prompt + "\n\nReturn ONLY valid JSON matching the required shape. No prose, no markdown."
-    raw, err = _invoke(name, nudge, timeout, model, effort, web_search)
-    obj = extract_json((raw or "").strip())
-    if obj is not None:
-        ok, e = validate(obj, schema)
-        if ok:
-            return obj, None
-        return None, f"schema invalid after retry: {e}"
-    return None, "no valid JSON after retry"
+    raw, err = _invoke(name, nudge, timeout, model, effort, web_search, agentic)
+    obj, ok = _apply((raw or "").strip(), schema, extract)
+    if ok:
+        return obj, None
+    return None, (err or "no valid result after retry")
 
 
 def _notify(stream: str, msg: str) -> None:
@@ -249,33 +296,53 @@ def _notify(stream: str, msg: str) -> None:
 
 
 # ---- the chain -----------------------------------------------------------------------------------
-def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, timeout: float = 120.0,
-         model: Optional[str] = None, effort: Optional[str] = None,
-         notify: Optional[str] = None, web_search: bool = False) -> Result:
-    """Try providers in `chain` order; the first non-empty (and, with schema=, schema-valid) answer
-    wins. Never raises. Returns a Result (falsy if the whole chain failed).
+def _log(log, msg):
+    if log:
+        try:
+            log(msg)
+        except Exception:
+            pass
 
-    web_search=False (default) keeps the read-only-by-construction guarantee. web_search=True is an
-    explicit opt-in that grants the network search tool (codex web_search; cc/claude WebSearch+WebFetch;
-    gemini is search-grounded already) while codex stays FS-read-only -- a research call, not a plain
-    judgment. Never turn it on unless the task genuinely needs to look something up on the web."""
+
+def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, extract=None, mode: str = "judge",
+         timeout: float = 120.0, model: Optional[str] = None, effort: Optional[str] = None,
+         notify: Optional[str] = None, log=None, web_search: Optional[bool] = None) -> Result:
+    """Try providers in `chain` order; the first non-empty (and, with schema=/extract=, parseable)
+    answer wins. Never raises. Returns a Result (falsy if the whole chain failed).
+
+    Structured output: schema=<JSON-Schema> validates + returns Result.data; extract=<callable(text)->obj>
+    is the general form (return None to reject -> same-provider retry then fall through). extract= wins
+    over schema=; both get one same-provider nudge-retry before the next provider.
+
+    Capability tiers via mode= (default "judge" = read-only, MCP off, deterministic -- for classify /
+    extract / draft / parse where the whole input is in the prompt): "research" grants the network
+    search tool (== web_search=True); "agent" grants full agency (codex workspace-write in-process;
+    cc/claude delegate to the agent runner). web_search overrides mode's network (None follows mode, True/False
+    force). mode="agent" is an explicit escape hatch -- never use it on untrusted input.
+
+    log=<callable(str)> is invoked once per attempt ("<provider>: answered / unavailable")."""
+    web = web_search if web_search is not None else (mode == "research")
+    agentic = (mode == "agent")
     r = Result()
     for name in chain:
         t0 = time.time()
         data = None
         try:
-            raw, err = _invoke(name, prompt, timeout, model, effort, web_search)
+            raw, err = _invoke(name, prompt, timeout, model, effort, web, agentic)
             text = (raw or "").strip()
-            if text and schema is not None:
-                data, verr = _validate_or_retry(name, prompt, text, schema, timeout, model, effort, web_search)
+            if text and (schema is not None or extract is not None):
+                data, verr = _extract_or_retry(name, prompt, text, schema, extract,
+                                                timeout, model, effort, web, agentic)
                 if data is None:
-                    text, err = "", verr  # schema-invalid counts as a provider miss
+                    text, err = "", verr  # unparseable / schema-invalid counts as a provider miss
         except Exception as e:  # the never-raises guarantee: a provider bug cannot escape the chain
             text, err = "", str(e)[:200]
         ms = int((time.time() - t0) * 1000)
         if not text:
+            _log(log, f"{name}: unavailable ({err})")
             r.attempts.append(Attempt(name, False, ms, err))
             continue
+        _log(log, f"{name}: answered")
         r.text, r.provider, r.data = text, name, data
         r.attempts.append(Attempt(name, True, ms))
         return r
@@ -305,8 +372,9 @@ def _self_judge(orig_prompt, answer, chain, timeout, model, effort):
 
 
 def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, schema=None,
-           timeout: float = 120.0, model: Optional[str] = None, effort: Optional[str] = None,
-           notify: Optional[str] = None, web_search: bool = False) -> Result:
+           extract=None, mode: str = "judge", timeout: float = 120.0, model: Optional[str] = None,
+           effort: Optional[str] = None, notify: Optional[str] = None, log=None,
+           web_search: Optional[bool] = None) -> Result:
     """Iterative deepening: generate an answer, then decide from that answer whether to think harder,
     up to max_depth further passes. Generalizes the "a single headless call cannot be course-corrected"
     pattern into the primitive. Two judge modes:
@@ -320,7 +388,7 @@ def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, 
 
     Returns the final Result (Result.depth = passes taken, Result.attempts spans them all). Never
     raises; a total failure at any pass returns the best Result so far."""
-    r = call(prompt, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort, web_search=web_search)
+    r = call(prompt, chain=chain, schema=schema, extract=extract, mode=mode, timeout=timeout, model=model, effort=effort, web_search=web_search, log=log)
     attempts = list(r.attempts)
     if not r:
         r.attempts = attempts
@@ -333,14 +401,14 @@ def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, 
                 nxt = judge(r, depth)
                 if not nxt:
                     break
-                r2 = call(nxt, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort, web_search=web_search)
+                r2 = call(nxt, chain=chain, schema=schema, extract=extract, mode=mode, timeout=timeout, model=model, effort=effort, web_search=web_search, log=log)
             else:
                 verdict = _self_judge(prompt, r.text, chain, timeout, model, effort)
                 if verdict is None or verdict.upper().startswith("DONE"):
                     break
                 improve = (f"{prompt}\n\nYour previous answer:\n{r.text}\n\nAn independent reviewer says "
                            f"it can be improved:\n{verdict}\n\nProduce a better, complete answer.")
-                r2 = call(improve, chain=chain, schema=schema, timeout=timeout, model=model, effort=effort, web_search=web_search)
+                r2 = call(improve, chain=chain, schema=schema, extract=extract, mode=mode, timeout=timeout, model=model, effort=effort, web_search=web_search, log=log)
         except Exception:
             break
         if not r2:

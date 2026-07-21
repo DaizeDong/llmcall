@@ -25,8 +25,10 @@ def main() -> int:
     ap.add_argument("--model", default=None)
     ap.add_argument("--effort", default=None)
     ap.add_argument("--notify", default=None, help="the relay project stream to alert on total failure")
-    ap.add_argument("--web-search", dest="web_search", action="store_true",
-                    help="opt into the network search tool (off by default; relaxes read-only)")
+    ap.add_argument("--mode", choices=["judge", "research", "agent"], default="judge",
+                    help="capability tier: judge (default, read-only) | research (web) | agent (full)")
+    ap.add_argument("--web-search", dest="web_search", action="store_const", const=True, default=None,
+                    help="force the network search tool on (else follows --mode)")
     a = ap.parse_args()
 
     schema = None
@@ -35,8 +37,8 @@ def main() -> int:
             schema = json.load(f)
     prompt = sys.stdin.read()
     r = call(prompt, chain=[c.strip() for c in a.chain.split(",") if c.strip()],
-             schema=schema, timeout=a.timeout, model=a.model, effort=a.effort, notify=a.notify,
-             web_search=a.web_search)
+             schema=schema, mode=a.mode, timeout=a.timeout, model=a.model, effort=a.effort,
+             notify=a.notify, web_search=a.web_search)
     if not r:
         sys.stderr.write((r.error or "chain failed") + "\n")
         return 1

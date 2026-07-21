@@ -4,21 +4,55 @@ and items. Returns (ok, error_message)."""
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Optional, Tuple
 
 
+def _iter_top_level(text: str):
+    """Yield each top-level brace/bracket-balanced {...} or [...] substring, in order. String-aware:
+    a { } [ ] inside a JSON double-quoted string (honoring \\ escapes) does not move the depth, so
+    prose or a log line that merely mentions a brace cannot corrupt the scan."""
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch in "}]":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    yield text[start:i + 1]
+                    start = -1
+
+
 def extract_json(text: str) -> Any:
-    """Pull the first JSON object or array out of a model's text (which may wrap it in prose)."""
+    """Pull a JSON object/array out of a model's text (which may wrap it in prose or log chrome).
+
+    Returns the FIRST top-level balanced {...}/[...] span that actually json.loads. This is strictly
+    more robust than a greedy `\\{.*\\}` regex (which over-captures from the first brace to the last and
+    is defeated by any stray brace in surrounding prose), and it is what every schema= consumer relies
+    on. For the rarer "pick the object that HAS key X" need, pass call(..., extract=<callable>)."""
     if not text:
         return None
-    m = re.search(r"\[.*\]|\{.*\}", text, re.S)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return None
+    for cand in _iter_top_level(text):
+        try:
+            return json.loads(cand)
+        except (ValueError, TypeError):
+            continue
+    return None
 
 
 def validate(obj: Any, schema: dict) -> Tuple[bool, Optional[str]]:
