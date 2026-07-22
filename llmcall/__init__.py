@@ -5,7 +5,7 @@
     r.text, r.provider         # the answer + who gave it
     str(r), bool(r)            # str-coercible + truthy (drop-in for the old str | None)
 
-`call_chain` is a back-compat shim matching the legacy shim.call_chain (returns str|None).
+`call_chain` is a back-compat shim for the legacy call_chain(prompt, chain, ...) signature (str|None).
 """
 from .core import DEFAULT_CHAIN, Attempt, Result, call, refine
 

@@ -24,7 +24,7 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--model", default=None)
     ap.add_argument("--effort", default=None)
-    ap.add_argument("--notify", default=None, help="the relay project stream to alert on total failure")
+    ap.add_argument("--notify", default=None, help="relay stream to alert on total failure")
     ap.add_argument("--mode", choices=["judge", "research", "agent"], default="judge",
                     help="capability tier: judge (default, read-only) | research (web) | agent (full)")
     ap.add_argument("--web-search", dest="web_search", action="store_const", const=True, default=None,

@@ -356,7 +356,7 @@ def test_cc_agent_delegates_to_runner(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
     text, err = core._invoke("cc", "p", 10, None, None, False, True)  # agentic=True
     assert text == "agent answer" and err is None
-    assert any("agent-runner" in str(c) for c in cap["cmd"]) and "-Capture" in cap["cmd"]
+    assert any("agent-runner.ps1" in str(c) for c in cap["cmd"]) and "-Capture" in cap["cmd"]
 
 
 # ---- log= callback -------------------------------------------------------------------------------

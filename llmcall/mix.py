@@ -1,9 +1,9 @@
 """Provider-mix report over the llmcall ledger (see core._ledger).
 
-Makes silent provider degradation visible: if the codex chain or the cc provider dies, llmcall's
-never-raises quietly routes the chain to the fallback provider and the only other signal is the
-provider bill. This reads the append-only ledger, aggregates who actually SERVED each call over a
-window, and (optionally) alerts when codex's share drops below a floor.
+Makes silent provider degradation visible: if the codex chain or a provider dies, llmcall's
+never-raises quietly falls through to the last provider, invisible unless you aggregate who
+actually SERVED each call. This reads the append-only ledger over a window and (optionally) alerts
+when codex's share drops below a floor.
 
   python -m llmcall.mix                     # human summary of the last 24h
   python -m llmcall.mix --hours 168 --json  # machine-readable, 7-day window
@@ -78,7 +78,7 @@ def aggregate(recs):
 
 
 def _alert(stream, msg):
-    relay = os.path.expanduser("the relay")
+    relay = os.path.expanduser(os.environ.get("LLMCALL_RELAY", "~/.llmcall/relay.py"))
     if not os.path.isfile(relay):
         sys.stderr.write("mix: relay not found, cannot alert\n")
         return
@@ -116,7 +116,7 @@ def main(argv=None):
     if a.alert_below is not None and agg["calls"] and agg["codex_share"] is not None \
             and agg["codex_share"] < a.alert_below:
         _alert(a.stream, "warning [llmcall] codex share %.0f%% < %.0f%% over %d calls -- "
-                         "provider degraded (cc provider / codex chain?). %s"
+                         "provider degraded (codex chain / a provider down?). %s"
                          % (agg["codex_share"] * 100, a.alert_below * 100, agg["calls"], summary_line(agg)))
 
     if a.json:

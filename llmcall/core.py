@@ -59,10 +59,12 @@ _CC_WEB_TOOLS = ("--allowedTools", "WebSearch", "WebFetch")
 
 # Capability tiers. mode="judge" (default) = read-only judgment (all footguns above). mode="research" =
 # judge + the network search tool (== web_search=True). mode="agent" = full agency, provider-split:
-# codex flips its sandbox to workspace-write in-process; cc/claude DELEGATE to the agent runner (the resilient
-# full-session skill runner) rather than growing an agentic runner inside the judgment primitive.
+# codex flips its sandbox to workspace-write in-process; cc/claude DELEGATE to an external agent
+# runner rather than growing an agentic runner inside the judgment primitive.
 _MODES = ("judge", "research", "agent")
-_RUN_CLAUDE_AGENT = os.path.expanduser(r"the agent runner")
+# The mode="agent" delegate for cc/claude: an executable that runs a full agentic session and prints
+# the final answer on stdout. Configure its path via LLMCALL_AGENT_RUNNER.
+_AGENT_RUNNER = os.path.expanduser(os.environ.get("LLMCALL_AGENT_RUNNER", "~/.llmcall/agent-runner.ps1"))
 
 
 @dataclass
@@ -202,16 +204,16 @@ def _claude_family(name, paths, prompt, timeout, model, web_search=False, agenti
 
 
 def _claude_agent(prompt, timeout):
-    """mode="agent" for cc/claude DELEGATES to the agent runner (agent-runner -Capture): it reuses that
-    runner's resilient cc -> claude-direct transport (gateway-unset fallback) and full-session tool
-    access, and returns the final answer on stdout. Never used on untrusted input; never the default;
-    codex has NO the agent runner home (it cannot run Claude Code skills) so its agent path stays in-process."""
-    if not os.path.isfile(_RUN_CLAUDE_AGENT):
-        return None, "agent-runner not found (mode='agent' delegate unavailable)"
+    """mode="agent" for cc/claude delegates to an external agent runner (LLMCALL_AGENT_RUNNER): a
+    script that runs a full agentic session with tool access and returns the final answer on stdout.
+    Never used on untrusted input; never the default; codex has no such delegate so its agent path
+    stays in-process (workspace-write)."""
+    if not os.path.isfile(_AGENT_RUNNER):
+        return None, "agent runner not found (set LLMCALL_AGENT_RUNNER; mode='agent' delegate unavailable)"
     fd, logpath = tempfile.mkstemp(prefix="llmcall_agent_", suffix=".log")
     os.close(fd)
     try:
-        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _RUN_CLAUDE_AGENT,
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", _AGENT_RUNNER,
                "-Prompt", prompt, "-Log", logpath, "-Capture"]
         stdout, err = _run(cmd, "", timeout)
         if stdout is None:
@@ -285,7 +287,7 @@ def _extract_or_retry(name, prompt, text, schema, extract, timeout, model, effor
 
 
 def _notify(stream: str, msg: str) -> None:
-    relay = os.path.expanduser("the relay")
+    relay = os.path.expanduser(os.environ.get("LLMCALL_RELAY", "~/.llmcall/relay.py"))
     if not os.path.isfile(relay):
         return
     try:
@@ -297,8 +299,8 @@ def _notify(stream: str, msg: str) -> None:
 
 # ---- provider-mix telemetry (append-only, out-of-repo, never affects the call) -------------------
 # One JSONL line per call recording WHICH provider actually served. Makes silent provider degradation
-# visible (e.g. the cc provider dying -> a provider silently degrades, whose
-# only other signal is the provider bill). Off nowhere by default because it is pure local telemetry
+# visible (e.g. a provider quietly failing so the chain falls through to the last one, invisible
+# unless you aggregate Result.provider). Off nowhere by default because it is pure local telemetry
 # (no network, no PII -- prompt/reply are recorded only as CHAR COUNTS). LLMCALL_LEDGER=0 disables it;
 # LLMCALL_LEDGER=<path> overrides the location. A ledger write can NEVER raise into the caller.
 _LEDGER_DEFAULT = os.path.expanduser(r"~/.llmcall/ledger.jsonl")
@@ -347,7 +349,7 @@ def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, extract=None, mode: s
     Capability tiers via mode= (default "judge" = read-only, MCP off, deterministic -- for classify /
     extract / draft / parse where the whole input is in the prompt): "research" grants the network
     search tool (== web_search=True); "agent" grants full agency (codex workspace-write in-process;
-    cc/claude delegate to the agent runner). web_search overrides mode's network (None follows mode, True/False
+    cc/claude delegate to an external agent runner). web_search overrides mode's network (None follows mode, True/False
     force). mode="agent" is an explicit escape hatch -- never use it on untrusted input.
 
     log=<callable(str)> is invoked once per attempt ("<provider>: answered / unavailable")."""
