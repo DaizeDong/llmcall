@@ -11,6 +11,13 @@ from llmcall import Result, call, call_chain, core
 from llmcall.schema import extract_json, validate
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ledger(tmp_path, monkeypatch):
+    """Redirect the provider-mix ledger to a temp file for EVERY test so a real call() in the suite
+    never appends to the operator's ~/.llmcall/ledger.jsonl."""
+    monkeypatch.setenv("LLMCALL_LEDGER", str(tmp_path / "ledger.jsonl"))
+
+
 # ---- helpers: replace the per-provider _invoke with a scripted one --------------------------------
 def _fixed(mapping):
     calls = []
@@ -451,3 +458,94 @@ def test_refine_first_pass_failure_is_falsy(monkeypatch):
     monkeypatch.setattr(core, "_invoke", lambda *a: (None, "down"))
     r = refine("task")
     assert not r and r.depth == 0
+
+
+# ---- provider-mix ledger (telemetry; must never affect the call) ---------------------------------
+from llmcall import mix  # noqa: E402
+
+
+def _ledger_lines(monkeypatch, tmp_path, name="l.jsonl"):
+    p = tmp_path / name
+    monkeypatch.setenv("LLMCALL_LEDGER", str(p))
+    return p
+
+
+def test_ledger_records_served_provider(monkeypatch, tmp_path):
+    p = _ledger_lines(monkeypatch, tmp_path)
+    fake, _ = _fixed({"codex": (None, "down"), "cc": ("from cc", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = call("x")
+    assert r.provider == "cc"
+    rec = json.loads(p.read_text(encoding="utf-8").strip())
+    assert rec["provider"] == "cc" and rec["ok"] is True
+    assert rec["prompt_chars"] == 1 and rec["reply_chars"] == len("from cc")
+    assert rec["attempts"] == 2  # codex miss + cc answer
+
+
+def test_ledger_records_total_failure(monkeypatch, tmp_path):
+    p = _ledger_lines(monkeypatch, tmp_path)
+    fake, _ = _fixed({})
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("x")
+    rec = json.loads(p.read_text(encoding="utf-8").strip())
+    assert rec["provider"] is None and rec["ok"] is False and rec["error"]
+
+
+def test_ledger_disabled_by_env(monkeypatch, tmp_path):
+    p = tmp_path / "off.jsonl"
+    monkeypatch.setenv("LLMCALL_LEDGER", "0")
+    fake, _ = _fixed({"codex": ("ok", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("x")
+    assert not p.exists()  # LLMCALL_LEDGER=0 -> no file written anywhere
+    assert core._ledger_path() is None
+
+
+def test_ledger_write_failure_never_breaks_call(monkeypatch, tmp_path):
+    # point the ledger at an unwritable path (a dir where a file is expected) -> _ledger swallows it
+    monkeypatch.setenv("LLMCALL_LEDGER", str(tmp_path))  # a directory, open(...) will fail
+    fake, _ = _fixed({"codex": ("ok", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = call("x")  # must still succeed despite the ledger write failing
+    assert r.provider == "codex" and r.text == "ok"
+
+
+def test_mix_aggregate_and_share():
+    recs = [{"provider": "codex", "ok": True, "prompt_chars": 10, "reply_chars": 5, "ms": 100, "mode": "judge"},
+            {"provider": "codex", "ok": True, "prompt_chars": 10, "reply_chars": 5, "ms": 200, "mode": "judge"},
+            {"provider": "claude", "ok": True, "prompt_chars": 10, "reply_chars": 5, "ms": 300, "mode": "judge"},
+            {"provider": None, "ok": False, "prompt_chars": 10, "reply_chars": 0, "mode": "judge"}]
+    agg = mix.aggregate(recs)
+    assert agg["calls"] == 4 and agg["ok"] == 3 and agg["failed"] == 1
+    assert agg["codex_share"] == round(2 / 4, 3)
+    assert agg["served"]["codex"] == 2 and agg["served"]["claude"] == 1 and agg["served"]["NONE"] == 1
+    assert agg["avg_ms"] == round((100 + 200 + 300) / 3)
+
+
+def test_mix_alert_fires_below_threshold(monkeypatch, tmp_path):
+    p = tmp_path / "mix.jsonl"
+    # 1 codex + 3 claude -> codex share 0.25
+    p.write_text("\n".join(json.dumps(r) for r in [
+        {"provider": "codex", "ok": True}, {"provider": "claude", "ok": True},
+        {"provider": "claude", "ok": True}, {"provider": "claude", "ok": True}]), encoding="utf-8")
+    alerts = []
+    monkeypatch.setattr(mix, "_alert", lambda stream, msg: alerts.append((stream, msg)))
+    mix.main(["--ledger", str(p), "--alert-below", "0.5", "--stream", "infra"])
+    assert len(alerts) == 1 and alerts[0][0] == "infra" and "codex share 25%" in alerts[0][1]
+
+
+def test_mix_no_alert_when_healthy(monkeypatch, tmp_path):
+    p = tmp_path / "mix.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in [
+        {"provider": "codex", "ok": True}, {"provider": "codex", "ok": True},
+        {"provider": "codex", "ok": True}, {"provider": "claude", "ok": True}]), encoding="utf-8")
+    alerts = []
+    monkeypatch.setattr(mix, "_alert", lambda stream, msg: alerts.append(msg))
+    mix.main(["--ledger", str(p), "--alert-below", "0.5"])
+    assert alerts == []  # codex share 75% >= 50%, no alert
+
+
+def test_mix_empty_ledger_is_not_an_error(tmp_path):
+    agg = mix.aggregate([])
+    assert agg["calls"] == 0 and agg["codex_share"] is None
+    assert "empty" in mix.summary_line(agg)

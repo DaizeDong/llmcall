@@ -295,6 +295,36 @@ def _notify(stream: str, msg: str) -> None:
         pass
 
 
+# ---- provider-mix telemetry (append-only, out-of-repo, never affects the call) -------------------
+# One JSONL line per call recording WHICH provider actually served. Makes silent provider degradation
+# visible (e.g. the cc provider dying -> a provider silently degrades, whose
+# only other signal is the provider bill). Off nowhere by default because it is pure local telemetry
+# (no network, no PII -- prompt/reply are recorded only as CHAR COUNTS). LLMCALL_LEDGER=0 disables it;
+# LLMCALL_LEDGER=<path> overrides the location. A ledger write can NEVER raise into the caller.
+_LEDGER_DEFAULT = os.path.expanduser(r"~/.llmcall/ledger.jsonl")
+
+
+def _ledger_path() -> Optional[str]:
+    val = os.environ.get("LLMCALL_LEDGER")
+    if val is not None:
+        if val.strip() in ("0", "off", "false", ""):
+            return None
+        return os.path.expanduser(val)
+    return _LEDGER_DEFAULT
+
+
+def _ledger(rec: dict) -> None:
+    path = _ledger_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # telemetry must never break a call
+
+
 # ---- the chain -----------------------------------------------------------------------------------
 def _log(log, msg):
     if log:
@@ -345,8 +375,14 @@ def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, extract=None, mode: s
         _log(log, f"{name}: answered")
         r.text, r.provider, r.data = text, name, data
         r.attempts.append(Attempt(name, True, ms))
+        _ledger({"provider": name, "chain": list(chain), "mode": mode, "web": web,
+                 "prompt_chars": len(prompt), "reply_chars": len(text),
+                 "ms": ms, "attempts": len(r.attempts), "ok": True})
         return r
     r.error = r.attempts[-1].error if r.attempts else "no provider available"
+    _ledger({"provider": None, "chain": list(chain), "mode": mode, "web": web,
+             "prompt_chars": len(prompt), "reply_chars": 0,
+             "attempts": len(r.attempts), "ok": False, "error": (r.error or "")[:120]})
     if notify:
         _notify(notify, f"llmcall chain failed ({','.join(chain)}): {r.error}")
     return r
