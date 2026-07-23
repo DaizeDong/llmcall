@@ -17,7 +17,25 @@ import sys
 from .core import DEFAULT_CHAIN, call
 
 
+def _force_utf8_stdio() -> None:
+    """Windows defaults stdin/stdout to the ANSI code page (GBK/cp936 on a zh box), so reading a UTF-8
+    prompt file or writing an answer that contains an emoji or CJK raises UnicodeEncodeError and takes
+    the whole call down (observed: a model reply starting with U+1F6A8 crashed sys.stdout.write). This
+    CLI is UTF-8 end to end by contract, so pin both streams to UTF-8 regardless of the OS locale.
+    Guarded for interpreters without TextIOWrapper.reconfigure and for redirected/piped streams."""
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass  # detached / already-consumed stream: nothing we can do, and not worth crashing over
+
+
 def main() -> int:
+    _force_utf8_stdio()
     ap = argparse.ArgumentParser(prog="llmcall", description="headless codex -> cc -> claude judgment")
     ap.add_argument("--chain", default=",".join(DEFAULT_CHAIN))
     ap.add_argument("--schema", default=None, help="path to a JSON-Schema file for validated output")

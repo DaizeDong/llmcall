@@ -3,6 +3,7 @@ opt-in real-codex smoke at the bottom (gated behind LLMCALL_SMOKE=1)."""
 import json
 import os
 import subprocess
+import sys
 
 import pytest
 
@@ -549,3 +550,34 @@ def test_mix_empty_ledger_is_not_an_error(tmp_path):
     agg = mix.aggregate([])
     assert agg["calls"] == 0 and agg["codex_share"] is None
     assert "empty" in mix.summary_line(agg)
+
+
+# ---- Windows UTF-8 stdio (GBK-crash regression) --------------------------------------------------
+def test_force_utf8_stdio_survives_emoji_on_gbk_stream(monkeypatch):
+    """Regression: on Windows a zh-CN box gives stdout the GBK code page, so writing an emoji/CJK answer
+    crashed with UnicodeEncodeError. _force_utf8_stdio() must reconfigure the stream to UTF-8 so the
+    write survives. Simulate the GBK stream and assert both the reconfigure and a real emoji write."""
+    import io
+    from llmcall.__main__ import _force_utf8_stdio
+
+    buf = io.BytesIO()
+    gbk_stream = io.TextIOWrapper(buf, encoding="gbk")
+    monkeypatch.setattr(sys, "stdout", gbk_stream)
+    assert sys.stdout.encoding == "gbk"
+
+    _force_utf8_stdio()
+    assert sys.stdout.encoding == "utf-8"
+    sys.stdout.write("\U0001f6a8 alert 中文")  # would raise on the original gbk stream
+    sys.stdout.flush()
+    assert "\U0001f6a8 alert 中文".encode("utf-8") in buf.getvalue()
+
+
+def test_force_utf8_stdio_is_safe_when_reconfigure_missing(monkeypatch):
+    """Older/detached streams may lack .reconfigure; _force_utf8_stdio must no-op, never raise."""
+    from llmcall.__main__ import _force_utf8_stdio
+
+    class _NoReconfigure:
+        encoding = "ascii"
+    monkeypatch.setattr(sys, "stdout", _NoReconfigure())
+    _force_utf8_stdio()  # must not raise
+    assert sys.stdout.encoding == "ascii"
