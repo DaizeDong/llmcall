@@ -7,9 +7,9 @@
 
 `call_chain` is a back-compat shim for the legacy call_chain(prompt, chain, ...) signature (str|None).
 """
-from .core import DEFAULT_CHAIN, Attempt, Result, call, refine
+from .core import DEFAULT_CHAIN, Attempt, Result, call, call_many, refine
 
-__all__ = ["call", "refine", "call_chain", "Result", "Attempt", "DEFAULT_CHAIN"]
+__all__ = ["call", "call_many", "refine", "call_chain", "Result", "Attempt", "DEFAULT_CHAIN"]
 
 
 def call_chain(prompt, chain=None, providers=None, timeout=180, log=None):

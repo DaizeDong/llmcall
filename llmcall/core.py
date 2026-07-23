@@ -390,6 +390,49 @@ def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, extract=None, mode: s
     return r
 
 
+# ---- parallel fan-out (opt-in) -------------------------------------------------------------------
+# Independent judgments are OS-parallel already when they live in separate processes, but N independent
+# calls inside ONE process (e.g. classify every new email in a tick) run back-to-back unless fanned out.
+# Each provider call is IO-bound (it blocks on the provider CLI, which blocks on the network), so a
+# thread pool lets N codex processes run at once. Measured: 4 codex calls 25.1s serial -> 6.7s parallel
+# (3.8x), all served by codex, no throttling. IMPORTANT: this parallelizes INDEPENDENT calls; it does
+# NOT touch the codex->cc->claude chain inside a single call (that stays a serial cost ladder -- racing
+# the ladder would pay every provider on every call, defeating the design).
+_DEFAULT_FANOUT = 8
+
+
+def call_many(prompts, *, max_workers: int = _DEFAULT_FANOUT, chain=DEFAULT_CHAIN, schema=None,
+              extract=None, mode: str = "judge", timeout: float = 120.0, model: Optional[str] = None,
+              effort: Optional[str] = None, log=None, web_search: Optional[bool] = None) -> List[Result]:
+    """Run call() on each prompt CONCURRENTLY and return results in INPUT ORDER (results[i] is the
+    Result for prompts[i]). This is the parallel form of [call(p) for p in prompts]: every prompt still
+    walks its own full codex->cc->claude cost ladder; only the independent calls run at the same time.
+
+    max_workers caps concurrency (default 8): calls are IO-bound on the provider CLI, so this can exceed
+    the core count. Never raises -- a prompt whose call fails yields a falsy Result in its slot, exactly
+    like call(). notify= is intentionally omitted (per-call chain-failure alerts would be noisy across a
+    batch; inspect the returned Results, or wrap individual calls if you need alerting)."""
+    prompts = list(prompts)
+    if not prompts:
+        return []
+    workers = max(1, min(max_workers, len(prompts)))
+
+    def _one(p):
+        try:
+            return call(p, chain=chain, schema=schema, extract=extract, mode=mode, timeout=timeout,
+                        model=model, effort=effort, log=log, web_search=web_search)
+        except Exception as e:  # call() already never-raises, but keep the pool bulletproof
+            r = Result()
+            r.error = str(e)[:200]
+            return r
+
+    if workers == 1:
+        return [_one(p) for p in prompts]
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(_one, prompts))
+
+
 # ---- iterative deepening (opt-in) ----------------------------------------------------------------
 _JUDGE_SYS = (
     "You are independently reviewing an answer produced for a task. Decide whether it is COMPLETE and "

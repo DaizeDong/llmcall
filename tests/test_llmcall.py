@@ -8,7 +8,7 @@ import sys
 import pytest
 
 import llmcall
-from llmcall import Result, call, call_chain, core
+from llmcall import Result, call, call_chain, call_many, core
 from llmcall.schema import extract_json, validate
 
 
@@ -581,3 +581,77 @@ def test_force_utf8_stdio_is_safe_when_reconfigure_missing(monkeypatch):
     monkeypatch.setattr(sys, "stdout", _NoReconfigure())
     _force_utf8_stdio()  # must not raise
     assert sys.stdout.encoding == "ascii"
+
+
+# ---- call_many parallel fan-out ------------------------------------------------------------------
+def test_call_many_preserves_input_order(monkeypatch):
+    """results[i] must correspond to prompts[i] even though calls finish out of order."""
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        return ("ans:" + prompt, None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    out = call_many(["a", "b", "c", "d"])
+    assert [r.text for r in out] == ["ans:a", "ans:b", "ans:c", "ans:d"]
+    assert all(r.provider == "codex" for r in out)
+
+
+def test_call_many_runs_concurrently(monkeypatch):
+    """N calls must overlap in time, not run back-to-back. Each fake call sleeps; the wall-clock total
+    must be far below the serial sum, and peak concurrency must exceed 1."""
+    import threading
+    import time as _time
+    active = {"now": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        with lock:
+            active["now"] += 1
+            active["peak"] = max(active["peak"], active["now"])
+        _time.sleep(0.2)
+        with lock:
+            active["now"] -= 1
+        return ("ok", None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    t0 = _time.time()
+    out = call_many(["a", "b", "c", "d"], max_workers=4)
+    elapsed = _time.time() - t0
+    assert len(out) == 4 and all(r for r in out)
+    assert active["peak"] >= 2          # genuinely overlapped
+    assert elapsed < 0.6                # 4 x 0.2s serial would be 0.8s; parallel ~0.2s
+
+
+def test_call_many_empty_returns_empty(monkeypatch):
+    monkeypatch.setattr(core, "_invoke", (lambda *a, **k: ("x", None)))
+    assert call_many([]) == []
+
+
+def test_call_many_isolates_failures(monkeypatch):
+    """One prompt failing yields a falsy Result in its slot; the others still succeed."""
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        if prompt == "bad":
+            return (None, "down")
+        return ("ok:" + prompt, None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    out = call_many(["good1", "bad", "good2"], max_workers=3)
+    assert bool(out[0]) and out[0].text == "ok:good1"
+    assert not out[1]  # falsy Result, chain exhausted
+    assert bool(out[2]) and out[2].text == "ok:good2"
+
+
+def test_call_many_workers_one_is_serial_path(monkeypatch):
+    """max_workers=1 uses the serial list path (no pool) but returns identical results."""
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        return ("ans:" + prompt, None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    out = call_many(["a", "b"], max_workers=1)
+    assert [r.text for r in out] == ["ans:a", "ans:b"]
+
+
+def test_call_many_passes_schema_through(monkeypatch):
+    """schema= must apply per call, so a non-conforming answer becomes a falsy Result."""
+    schema = {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        return ('{"ok": true}', None) if prompt == "valid" else ("not json", None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    out = call_many(["valid", "invalid"], schema=schema, max_workers=2)
+    assert out[0].data == {"ok": True}
+    assert not out[1]  # unparseable -> miss -> falsy
