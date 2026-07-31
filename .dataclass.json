@@ -7,7 +7,7 @@
     "data_sealed = a path that HELD real data, was purged, and must stay dead.",
     "Enforced by tools/data_boundary.py in .githooks and CI."
   ],
-  "_audited": "2026-07-20 -- llmcall is a pure-stdlib codex->cc->claude call primitive. It produces NO real-run data: the only writes are ephemeral mkstemp tempfiles for codex stdin/stdout (in the OS temp dir, unlinked after use), never inside the repo. Tests use only synthetic placeholders (user1@example.com etc.). No DATA-class path, no FIXTURE. Empty lists here are a CONCLUSION (audited, nothing to declare), not a default.",
+  "_audited": "2026-07-31 RE-AUDIT (confirms the 2026-07-20 sweep). ANSWER: NO. llmcall is a stdlib-only codex->cc->claude call primitive. Its only writes are tempfile.mkstemp files for codex stdin/stdout, created in the OS temp dir and unlinked after use; nothing is appended, cached or journalled anywhere, in this repo or outside it. Tests use synthetic placeholders only. This is the one repo in the fleet whose empty declaration is empty because there is genuinely nothing to declare, rather than because the output lives somewhere else.",
   "data": [],
   "data_sealed": [],
   "fixture": []
