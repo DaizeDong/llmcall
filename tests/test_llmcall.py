@@ -140,11 +140,13 @@ def test_never_raises_even_if_provider_throws(monkeypatch):
 def test_cc_disables_mcp_and_unwraps_envelope(monkeypatch):
     cap = {}
 
-    def fake_run(cmd, input=None, **kw):
-        cap["cmd"] = cmd
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"result": "unwrapped text"}), stderr="")
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            cap["cmd"] = cmd; self.returncode = 0; self.pid = 4242
+        def communicate(self, input=None, timeout=None):
+            return (json.dumps({"result": "unwrapped text"}), "")
     monkeypatch.setattr(core, "_find", lambda n, c: "/x/cc.exe")
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
     text, err = core._invoke("cc", "p", 10, None, None)
     assert text == "unwrapped text" and err is None
     assert "--strict-mcp-config" in cap["cmd"] and '{"mcpServers":{}}' in cap["cmd"]
@@ -154,15 +156,16 @@ def test_cc_disables_mcp_and_unwraps_envelope(monkeypatch):
 def test_codex_reads_output_file_and_sets_readonly(monkeypatch, tmp_path):
     cap = {}
 
-    def fake_run(cmd, input=None, **kw):
-        cap["cmd"] = cmd
-        # emulate codex: write the final message to the -o outfile
-        out = cmd[cmd.index("-o") + 1]
-        with open(out, "w", encoding="utf-8") as f:
-            f.write("codex final answer")
-        return subprocess.CompletedProcess(cmd, 0, stdout="reasoning preamble noise", stderr="")
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            cap["cmd"] = cmd; self.returncode = 0; self.pid = 4242
+            # emulate codex: write the final message to the -o outfile
+            with open(cmd[cmd.index("-o") + 1], "w", encoding="utf-8") as f:
+                f.write("codex final answer")
+        def communicate(self, input=None, timeout=None):
+            return ("reasoning preamble noise", "")
     monkeypatch.setattr(core, "_find", lambda n, c: "/x/codex")
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
     text, err = core._invoke("codex", "p", 10, "gpt-x", "high")
     assert text == "codex final answer" and err is None
     assert "-s" in cap["cmd"] and "read-only" in cap["cmd"] and "--ephemeral" in cap["cmd"]
@@ -179,12 +182,14 @@ def test_missing_binary_is_a_clean_miss(monkeypatch):
 def test_gemini_argv_and_plain_text(monkeypatch):
     cap = {}
 
-    def fake_run(cmd, input=None, **kw):
-        cap["cmd"] = cmd
-        cap["stdin"] = input
-        return subprocess.CompletedProcess(cmd, 0, stdout="gemini plain answer", stderr="")
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            cap["cmd"] = cmd; self.returncode = 0; self.pid = 4242
+        def communicate(self, input=None, timeout=None):
+            cap["stdin"] = input
+            return ("gemini plain answer", "")
     monkeypatch.setattr(core, "_find", lambda n, c: "/x/gemini.cmd")
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
     text, err = core._invoke("gemini", "the prompt", 10, None, None)
     assert text == "gemini plain answer" and err is None            # plain text, no JSON envelope unwrap
     assert "-m" in cap["cmd"] and core._GEMINI_FALLBACK_MODEL in cap["cmd"]
@@ -214,14 +219,23 @@ def test_gemini_exclusive_chain(monkeypatch):
 def _capture_cmd(monkeypatch, stdout="ok"):
     cap = {}
 
-    def fake_run(cmd, input=None, **kw):
-        cap["cmd"] = cmd
-        if "-o" in cmd:  # codex writes to the outfile
-            with open(cmd[cmd.index("-o") + 1], "w", encoding="utf-8") as f:
-                f.write("codex answer")
-        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+    # _run now uses subprocess.Popen (so a timeout can kill the whole process tree), so the tests
+    # mock Popen rather than run. The fake supports the small surface _run touches: communicate()
+    # with input+timeout, a returncode, and a pid for the (never-taken here) kill path.
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            cap["cmd"] = cmd
+            self.returncode = 0
+            self.pid = 4242
+            if "-o" in cmd:  # codex writes its answer to the outfile
+                with open(cmd[cmd.index("-o") + 1], "w", encoding="utf-8") as f:
+                    f.write("codex answer")
+
+        def communicate(self, input=None, timeout=None):
+            return (stdout, "")
+
     monkeypatch.setattr(core, "_find", lambda n, c: "/x/bin")
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
     return cap
 
 
@@ -350,14 +364,17 @@ def test_codex_judge_stays_read_only(monkeypatch):
 def test_cc_agent_delegates_to_runner(monkeypatch):
     cap = {}
 
-    def fake_run(cmd, input=None, **kw):
-        cap["cmd"] = cmd
-        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"result": "agent answer"}), stderr="")
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            cap["cmd"] = cmd; self.returncode = 0; self.pid = 4242
+        def communicate(self, input=None, timeout=None):
+            return (json.dumps({"result": "agent answer"}), "")
     monkeypatch.setattr(core.os.path, "isfile", lambda p: True)
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
     text, err = core._invoke("cc", "p", 10, None, None, False, True)  # agentic=True
     assert text == "agent answer" and err is None
-    assert any("agent-runner.ps1" in str(c) for c in cap["cmd"]) and "-Capture" in cap["cmd"]
+    # the configured runner path (whatever LLMCALL_AGENT_RUNNER points at) is passed, with -Capture
+    assert core._AGENT_RUNNER in cap["cmd"] and "-Capture" in cap["cmd"]
 
 
 # ---- log= callback -------------------------------------------------------------------------------

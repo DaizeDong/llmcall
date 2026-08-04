@@ -110,15 +110,60 @@ def _argv(binp: str, *args: str) -> List[str]:
     return [binp, *args]
 
 
+def _kill_tree(pid: int) -> None:
+    """Kill a process AND all its descendants.
+
+    subprocess's own timeout kills only the DIRECT child. On Windows a `.cmd` launcher runs as
+    `cmd /c codex.cmd ...`, which spawns node/codex grandchildren; those inherit the stdout
+    pipe, survive the direct-child kill, and hold the write end open so the read end never sees
+    EOF and the drain blocks forever. Measured in the wild: a 420s codex timeout became a
+    34-hour freeze with 50+ orphaned codex.exe holding the handle, which stalled a whole daily
+    pipeline for two days. Killing the tree lets the pipe close."""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                       capture_output=True, **_NOWINDOW)
+    else:
+        import os as _os
+        import signal as _signal
+        try:
+            _os.killpg(_os.getpgid(pid), _signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                _os.kill(pid, _signal.SIGKILL)
+            except OSError:
+                pass
+
+
 def _run(cmd: List[str], prompt: str, timeout: float) -> Tuple[Optional[str], Optional[str]]:
+    # Popen, not subprocess.run, so a timeout can kill the whole PROCESS TREE rather than just
+    # the direct child (see _kill_tree for the grandchild-pipe deadlock that makes run()'s own
+    # timeout hang indefinitely on Windows). Return contract is unchanged: (stdout|None, err|None).
+    popen_kw = dict(_NOWINDOW)
+    if sys.platform != "win32":
+        popen_kw["start_new_session"] = True      # own process group so killpg reaches the tree
     try:
-        p = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, **_NOWINDOW)
-    except (subprocess.TimeoutExpired, OSError) as e:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+                             **popen_kw)
+    except OSError as e:
+        return None, str(e)[:200]
+    try:
+        out, errtext = p.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(p.pid)
+        try:
+            # the writers are dead now, so this returns at once; the short ceiling is only a
+            # backstop against a handle that somehow outlives the tree kill.
+            p.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            _kill_tree(p.pid)
+        return None, f"timeout after {timeout:.0f}s"
+    except OSError as e:
+        _kill_tree(p.pid)
         return None, str(e)[:200]
     if p.returncode != 0:
-        return None, ((p.stderr or "").strip()[:200] or f"exit {p.returncode}")
-    return (p.stdout or ""), None
+        return None, ((errtext or "").strip()[:200] or f"exit {p.returncode}")
+    return (out or ""), None
 
 
 # ---- single source of truth for model + effort (kwarg -> ~/.codex/config.toml -> fallback) --------
