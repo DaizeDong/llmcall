@@ -48,7 +48,7 @@ _GEMINI_PATHS = [os.path.expanduser(r"~/AppData/Roaming/npm/gemini.cmd"),
 _NO_MCP = ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}')
 
 _CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
-_CODEX_FALLBACK_EFFORT = "max"
+_CODEX_FALLBACK_EFFORT = "xhigh"
 _CLAUDE_FALLBACK_MODEL = "claude-opus-4-8"
 _GEMINI_FALLBACK_MODEL = "gemini-3-pro-preview"
 
