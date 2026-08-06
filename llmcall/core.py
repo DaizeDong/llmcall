@@ -33,6 +33,25 @@ from .schema import extract_json, validate
 _NOWINDOW = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
 DEFAULT_CHAIN: Tuple[str, ...] = ("codex", "cc", "claude")
 
+
+def active_chain() -> Tuple[str, ...]:
+    """The chain used when a caller does not name one. `LLMCALL_CHAIN` overrides it, comma separated.
+
+    Exists because a provider can become unusable for reasons that have nothing to do with this code:
+    an outage, a quota, a suspended account. Before this, the only way to route around one was to edit
+    a constant in every repo that had grown its own copy of the ladder, which is neither fast nor
+    reversible, and guarantees one of them gets missed and keeps hammering a dead endpoint.
+
+    Read on every call, NOT captured at import, so flipping it takes effect on the next scheduled run
+    without restarting anything. An empty or all-blank value falls back to the built-in ladder rather
+    than to no providers at all: the failure mode of a typo here should be the normal chain, never a
+    silent total outage."""
+    raw = os.environ.get("LLMCALL_CHAIN")
+    if not raw:
+        return DEFAULT_CHAIN
+    names = tuple(n.strip() for n in raw.split(",") if n.strip())
+    return names or DEFAULT_CHAIN
+
 # Binary resolution: PATH first, then these absolute fallbacks (a scheduled task's minimal PATH would
 # otherwise silently slide the chain to a pricier provider or drop codex entirely).
 _CODEX_PATHS = [os.path.expanduser(r"~/AppData/Roaming/npm/codex.cmd"),
@@ -381,7 +400,7 @@ def _log(log, msg):
             pass
 
 
-def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, extract=None, mode: str = "judge",
+def call(prompt: str, *, chain=None, schema=None, extract=None, mode: str = "judge",
          timeout: float = 120.0, model: Optional[str] = None, effort: Optional[str] = None,
          notify: Optional[str] = None, log=None, web_search: Optional[bool] = None) -> Result:
     """Try providers in `chain` order; the first non-empty (and, with schema=/extract=, parseable)
@@ -397,7 +416,12 @@ def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, extract=None, mode: s
     cc/claude delegate to an external agent runner). web_search overrides mode's network (None follows mode, True/False
     force). mode="agent" is an explicit escape hatch -- never use it on untrusted input.
 
+    chain= names the providers to try, in order; omit it to follow active_chain() (the built-in
+    ladder, or whatever LLMCALL_CHAIN says). Resolved per call rather than bound at import, so a
+    provider can be routed around without restarting long-lived callers.
+
     log=<callable(str)> is invoked once per attempt ("<provider>: answered / unavailable")."""
+    chain = tuple(chain) if chain else active_chain()
     web = web_search if web_search is not None else (mode == "research")
     agentic = (mode == "agent")
     r = Result()
@@ -446,7 +470,7 @@ def call(prompt: str, *, chain=DEFAULT_CHAIN, schema=None, extract=None, mode: s
 _DEFAULT_FANOUT = 8
 
 
-def call_many(prompts, *, max_workers: int = _DEFAULT_FANOUT, chain=DEFAULT_CHAIN, schema=None,
+def call_many(prompts, *, max_workers: int = _DEFAULT_FANOUT, chain=None, schema=None,
               extract=None, mode: str = "judge", timeout: float = 120.0, model: Optional[str] = None,
               effort: Optional[str] = None, log=None, web_search: Optional[bool] = None) -> List[Result]:
     """Run call() on each prompt CONCURRENTLY and return results in INPUT ORDER (results[i] is the
@@ -497,7 +521,7 @@ def _self_judge(orig_prompt, answer, chain, timeout, model, effort):
     return r.text.strip() if r else None
 
 
-def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, schema=None,
+def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=None, schema=None,
            extract=None, mode: str = "judge", timeout: float = 120.0, model: Optional[str] = None,
            effort: Optional[str] = None, notify: Optional[str] = None, log=None,
            web_search: Optional[bool] = None) -> Result:
@@ -514,6 +538,10 @@ def refine(prompt: str, *, max_depth: int = 3, judge=None, chain=DEFAULT_CHAIN, 
 
     Returns the final Result (Result.depth = passes taken, Result.attempts spans them all). Never
     raises; a total failure at any pass returns the best Result so far."""
+    # Resolved HERE, not left to call(): the default judge rotates this tuple (_self_judge slices
+    # chain[1:] + chain[:1]), so an unresolved None would raise inside the loop's try and be
+    # swallowed as an early stop, silently turning refine into a single pass.
+    chain = tuple(chain) if chain else active_chain()
     r = call(prompt, chain=chain, schema=schema, extract=extract, mode=mode, timeout=timeout, model=model, effort=effort, web_search=web_search, log=log)
     attempts = list(r.attempts)
     if not r:

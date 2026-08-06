@@ -7,16 +7,20 @@
 
 `call_chain` is a back-compat shim for the legacy call_chain(prompt, chain, ...) signature (str|None).
 """
-from .core import DEFAULT_CHAIN, Attempt, Result, call, call_many, refine
+from .core import DEFAULT_CHAIN, Attempt, Result, active_chain, call, call_many, refine
 
-__all__ = ["call", "call_many", "refine", "call_chain", "Result", "Attempt", "DEFAULT_CHAIN"]
+__all__ = ["call", "call_many", "refine", "call_chain", "Result", "Attempt", "DEFAULT_CHAIN",
+           "active_chain"]
 
 
 def call_chain(prompt, chain=None, providers=None, timeout=180, log=None):
     """Back-compat: same signature/return (str | None) as the original llm_chain.call_chain. The
     `providers` per-provider overrides are accepted and ignored (model/effort now resolve from one
     source); pass model=/effort= to llmcall.call directly if you need an override."""
-    r = call(prompt, chain=tuple(chain) if chain else DEFAULT_CHAIN, timeout=timeout)
+    # None, not DEFAULT_CHAIN: naming the constant here would pin the ladder at this layer and make
+    # every caller that goes through the shim ignore LLMCALL_CHAIN. Letting call() resolve it is what
+    # keeps the override effective for the legacy signature too.
+    r = call(prompt, chain=tuple(chain) if chain else None, timeout=timeout)
     if log:
         for a in r.attempts:
             log("llmcall: %s %s" % (a.provider, "answered" if a.ok else "unavailable/empty, trying next"))

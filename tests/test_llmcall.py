@@ -672,3 +672,82 @@ def test_call_many_passes_schema_through(monkeypatch):
     out = call_many(["valid", "invalid"], schema=schema, max_workers=2)
     assert out[0].data == {"ok": True}
     assert not out[1]  # unparseable -> miss -> falsy
+
+
+# ---- LLMCALL_CHAIN: routing around a dead provider without editing code --------------------------
+# A provider can become unusable for reasons unrelated to this code: an outage, a quota, a suspended
+# account. Before this override the only remedy was editing a constant in every repo that had grown
+# its own copy of the ladder, which is slow, irreversible in a hurry, and certain to miss one, which
+# then keeps hammering the dead endpoint on its own schedule.
+def test_active_chain_defaults_to_the_builtin_ladder(monkeypatch):
+    monkeypatch.delenv("LLMCALL_CHAIN", raising=False)
+    assert core.active_chain() == core.DEFAULT_CHAIN
+
+
+def test_active_chain_follows_the_env(monkeypatch):
+    monkeypatch.setenv("LLMCALL_CHAIN", "cc,claude")
+    assert core.active_chain() == ("cc", "claude")
+    monkeypatch.setenv("LLMCALL_CHAIN", " cc , claude ")
+    assert core.active_chain() == ("cc", "claude"), "whitespace around names must not create ghosts"
+
+
+def test_a_blank_override_falls_back_rather_than_disabling_everything(monkeypatch):
+    """A typo here must degrade to the normal ladder, never to zero providers: a silent total outage
+    is a far worse failure than ignoring the override."""
+    for blank in ("", "   ", " , , "):
+        monkeypatch.setenv("LLMCALL_CHAIN", blank)
+        assert core.active_chain() == core.DEFAULT_CHAIN
+
+
+def test_call_without_a_chain_follows_the_override(monkeypatch):
+    monkeypatch.setenv("LLMCALL_CHAIN", "cc,claude")
+    fake, calls = _fixed({"codex": ("should never run", None), "cc": ("from cc", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = call("x")
+    assert r.provider == "cc"
+    assert "codex" not in calls, "the excluded provider must not be contacted at all"
+
+
+def test_the_legacy_shim_also_follows_the_override(monkeypatch):
+    """call_chain used to name DEFAULT_CHAIN itself, which pinned the ladder at that layer and made
+    every caller going through the legacy signature ignore the override. That is the path the
+    Agent Center dispatcher takes, so it is the one that mattered most."""
+    monkeypatch.setenv("LLMCALL_CHAIN", "cc,claude")
+    fake, calls = _fixed({"codex": ("should never run", None), "cc": ("from cc", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    assert call_chain("x") == "from cc"
+    assert "codex" not in calls
+
+
+def test_an_explicit_chain_still_wins_over_the_override(monkeypatch):
+    monkeypatch.setenv("LLMCALL_CHAIN", "cc,claude")
+    fake, calls = _fixed({"codex": ("from codex", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = call("x", chain=["codex"])
+    assert r.provider == "codex" and calls == ["codex"]
+
+
+def test_the_override_is_read_per_call_not_at_import(monkeypatch):
+    """Long-lived callers and scheduled tasks must pick the change up on their next run, without a
+    restart and without re-importing anything."""
+    fake, calls = _fixed({"codex": ("from codex", None), "cc": ("from cc", None)})
+    monkeypatch.setattr(core, "_invoke", fake)
+    monkeypatch.delenv("LLMCALL_CHAIN", raising=False)
+    assert call("x").provider == "codex"
+    monkeypatch.setenv("LLMCALL_CHAIN", "cc")
+    assert call("x").provider == "cc"
+
+
+def test_refine_resolves_the_chain_before_rotating_it(monkeypatch):
+    """refine's default judge rotates the chain (chain[1:] + chain[:1]). An unresolved None would
+    raise inside the loop's try and be swallowed as an early stop, silently making refine one pass."""
+    monkeypatch.setenv("LLMCALL_CHAIN", "cc,claude")
+    seen = []
+
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        seen.append(name)
+        return ("CONTINUE: more" if "reviewing an answer" in prompt else "draft"), None
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = llmcall.refine("task", max_depth=1)
+    assert r.depth == 1, "the judge must have run and asked for another pass"
+    assert "codex" not in seen
