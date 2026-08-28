@@ -127,6 +127,72 @@ def test_schema_exhausted_falls_through(monkeypatch):
     assert calls == ["codex", "codex", "cc"]
 
 
+# ---- the schema must actually REACH the provider -------------------------------------------------
+# Measured 2026-08-27 against the real cc provider, with the model-map refresher's own prompt and
+# schema. Attempt 1: the caller's prompt never mentions JSON, so the model answered in prose and
+# extract_json returned None. Attempt 2 (the nudge): the model returned well-formed, semantically
+# CORRECT JSON in a shape it invented -- {"fable": {...}, "haiku": {...}} -- because the shape was
+# never sent to it. validate() said: missing required 'map'. Both providers failed identically, and
+# the refresher's log shows 32 of 32 runs falling back to deterministic selection, never one success.
+#
+# The tests above cannot catch this: their fake provider returns valid JSON no matter what prompt it
+# is handed, so they assert the validator works while never asserting the model was told the shape.
+def _capture():
+    prompts = []
+
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        prompts.append(prompt)
+        return ('{"ok": true}', None)
+    return fake, prompts
+
+
+def test_schema_shape_is_sent_to_the_provider(monkeypatch):
+    fake, prompts = _capture()
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("pick one", schema=SCHEMA)
+    # The provider must be told the shape on the FIRST attempt, not left to guess it.
+    assert "ok" in prompts[0] and "required" in prompts[0]
+    assert json.dumps(SCHEMA, indent=2) in prompts[0]
+
+
+def test_schema_nudge_retry_also_carries_the_shape(monkeypatch):
+    calls = []
+
+    def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
+        calls.append(prompt)
+        return ("prose, no json", None) if len(calls) == 1 else ('{"ok": true}', None)
+    monkeypatch.setattr(core, "_invoke", fake)
+    r = call("pick one", schema=SCHEMA, chain=["codex"])
+    assert r.data == {"ok": True} and len(calls) == 2
+    # The retry said "matching the required shape" while withholding the shape. It must not.
+    assert json.dumps(SCHEMA, indent=2) in calls[1]
+
+
+def test_schema_block_is_appended_not_substituted(monkeypatch):
+    """Negative control: decorating the prompt must not lose the caller's own instructions."""
+    fake, prompts = _capture()
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("THE-CALLERS-OWN-WORDS", schema=SCHEMA)
+    assert "THE-CALLERS-OWN-WORDS" in prompts[0]
+
+
+def test_no_schema_leaves_the_prompt_byte_for_byte_untouched(monkeypatch):
+    """Negative control: a plain call must still send exactly what the caller wrote."""
+    fake, prompts = _capture()
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("just answer me")
+    assert prompts[0] == "just answer me"
+
+
+def test_extract_hook_prompt_is_not_decorated(monkeypatch):
+    """Negative control: extract= is a caller-side CALLABLE. There is no shape to render, so the
+    prompt must be left alone rather than decorated with some invented description of one."""
+    fake, prompts = _capture()
+    monkeypatch.setattr(core, "_invoke", fake)
+    call("just answer me", extract=lambda t: {"v": 1})
+    assert prompts[0] == "just answer me"
+
+
 # ---- never raises --------------------------------------------------------------------------------
 def test_never_raises_even_if_provider_throws(monkeypatch):
     def boom(name, prompt, timeout, model, effort, web_search=False, agentic=False):
@@ -667,7 +733,9 @@ def test_call_many_passes_schema_through(monkeypatch):
     """schema= must apply per call, so a non-conforming answer becomes a falsy Result."""
     schema = {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}
     def fake(name, prompt, timeout, model, effort, web_search=False, agentic=False):
-        return ('{"ok": true}', None) if prompt == "valid" else ("not json", None)
+        # startswith, not ==: schema= now appends the shape to the prompt, so the caller's text
+        # is a PREFIX of what the provider receives. Still discriminates the two prompts.
+        return ('{"ok": true}', None) if prompt.startswith("valid") else ("not json", None)
     monkeypatch.setattr(core, "_invoke", fake)
     out = call_many(["valid", "invalid"], schema=schema, max_workers=2)
     assert out[0].data == {"ok": True}

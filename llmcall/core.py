@@ -335,6 +335,26 @@ def _apply(text, schema, extract):
     return (obj if ok else None), ok
 
 
+def _schema_instruction(schema) -> str:
+    """The block appended to the caller's prompt when schema= is given, so the provider is TOLD the
+    shape instead of being asked to guess it.
+
+    Measured 2026-08-27, real cc provider, the model-map refresher's own prompt and schema. schema=
+    used to be validate-only: the shape was never rendered into any prompt, and the nudge retry said
+    "matching the required shape" while withholding the shape. The model was not the problem. It
+    answered correctly twice -- first as prose (the caller's prompt never says "JSON"), then, when
+    nudged, as well-formed JSON in a shape it had to invent, {"fable": ..., "haiku": ...}, where the
+    schema wanted {"map": {...}, "rationale": ...}. validate() rejected it: missing required 'map'.
+    Both providers failed identically because the omission was ours, not theirs, which is why the
+    refresher's log holds 32 llmcall failures and not one success, every one of them silently served
+    by the deterministic fallback.
+
+    Rendered as the JSON Schema itself rather than a prose paraphrase: it is what validate() actually
+    enforces, so the instruction cannot drift away from the check."""
+    return ("\n\nReturn ONLY a JSON value conforming to this JSON Schema. "
+            "No prose, no markdown, no code fence.\n" + json.dumps(schema, indent=2))
+
+
 def _extract_or_retry(name, prompt, text, schema, extract, timeout, model, effort, web_search, agentic):
     """Return (data, error). Apply schema=/extract= to the text; on a miss retry the SAME provider once
     with a nudge (per-provider self-correction) before the caller falls through to the next provider.
@@ -425,14 +445,20 @@ def call(prompt: str, *, chain=None, schema=None, extract=None, mode: str = "jud
     web = web_search if web_search is not None else (mode == "research")
     agentic = (mode == "agent")
     r = Result()
+    # Tell the provider the shape. extract= is a caller-side callable with no renderable shape,
+    # so its prompt is left exactly as written; only schema= decorates. Done once, before the
+    # loop, so every provider in the chain and the nudge retry inside _extract_or_retry all ask
+    # for the same thing -- a chain where provider 2 is asked a different question than provider
+    # 1 is not a fallback, it is two different experiments.
+    ask = prompt + _schema_instruction(schema) if schema is not None and extract is None else prompt
     for name in chain:
         t0 = time.time()
         data = None
         try:
-            raw, err = _invoke(name, prompt, timeout, model, effort, web, agentic)
+            raw, err = _invoke(name, ask, timeout, model, effort, web, agentic)
             text = (raw or "").strip()
             if text and (schema is not None or extract is not None):
-                data, verr = _extract_or_retry(name, prompt, text, schema, extract,
+                data, verr = _extract_or_retry(name, ask, text, schema, extract,
                                                 timeout, model, effort, web, agentic)
                 if data is None:
                     text, err = "", verr  # unparseable / schema-invalid counts as a provider miss
