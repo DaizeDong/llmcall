@@ -14,6 +14,9 @@ __all__ = ["call", "call_many", "refine", "call_chain", "Result", "Attempt", "DE
 
 
 def call_chain(prompt, chain=None, providers=None, timeout=180, log=None):
+    # timeout is passed straight to call(), so it means what it means there: the budget for the
+    # WHOLE chain, not for each provider in it. Callers of this wrapper inherited that change
+    # without touching their own code, which is why it is written here too.
     """Back-compat: same signature/return (str | None) as the original llm_chain.call_chain. The
     `providers` per-provider overrides are accepted and ignored (model/effort now resolve from one
     source); pass model=/effort= to llmcall.call directly if you need an override."""

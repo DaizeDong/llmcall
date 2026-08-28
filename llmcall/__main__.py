@@ -39,7 +39,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="llmcall", description="headless codex -> cc -> claude judgment")
     ap.add_argument("--chain", default=",".join(DEFAULT_CHAIN))
     ap.add_argument("--schema", default=None, help="path to a JSON-Schema file for validated output")
-    ap.add_argument("--timeout", type=float, default=120.0)
+    # Whole-chain budget, not per provider. Said here because this is where a person reads what
+    # the flag means; call()'s docstring is not on the path of someone typing --timeout.
+    ap.add_argument("--timeout", type=float, default=120.0,
+                    help="budget for the WHOLE chain in seconds (not per provider); a provider "
+                         "reached with too little left is skipped as budget exhausted")
     ap.add_argument("--model", default=None)
     ap.add_argument("--effort", default=None)
     ap.add_argument("--notify", default=None, help="relay stream to alert on total failure")

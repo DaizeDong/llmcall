@@ -83,6 +83,11 @@ _CC_WEB_TOOLS = ("--allowedTools", "WebSearch", "WebFetch")
 _MODES = ("judge", "research", "agent")
 # The mode="agent" delegate for cc/claude: an executable that runs a full agentic session and prints
 # the final answer on stdout. Configure its path via LLMCALL_AGENT_RUNNER.
+# The smallest budget worth handing a provider. Below this an attempt cannot finish, so the
+# chain reports "budget exhausted" instead of burning the remainder on an attempt that was
+# never going to land.
+_MIN_PROVIDER_BUDGET = 15.0
+
 _AGENT_RUNNER = os.path.expanduser(os.environ.get("LLMCALL_AGENT_RUNNER", "~/.llmcall/agent-runner.ps1"))
 
 
@@ -440,26 +445,65 @@ def call(prompt: str, *, chain=None, schema=None, extract=None, mode: str = "jud
     ladder, or whatever LLMCALL_CHAIN says). Resolved per call rather than bound at import, so a
     provider can be routed around without restarting long-lived callers.
 
+    timeout= is the budget for the WHOLE chain in seconds, not per provider: each attempt gets
+    whatever is left, and a provider reached with less than a usable remainder is skipped with
+    "budget exhausted" rather than being given a slice it cannot finish in. It was once applied
+    per provider, which meant the real worst case was timeout * len(chain) and a caller could not
+    bound its own wall clock, because the chain length comes from LLMCALL_CHAIN rather than from
+    the caller.
+
+    The honest bound is timeout + _MIN_PROVIDER_BUDGET, not timeout. With schema= or extract=, a
+    provider that answers unparseably gets one nudge retry, and that retry is floored rather than
+    handed the zero seconds that would be left: a nudge with no time is not a retry, it is a slower
+    way of failing. The overrun is ONE floor in total, not one per provider, because once the
+    deadline is gone the loop skips everything after it. Measured, not argued, in
+    tests/test_chain_budget_retry.py.
+
     log=<callable(str)> is invoked once per attempt ("<provider>: answered / unavailable")."""
     chain = tuple(chain) if chain else active_chain()
     web = web_search if web_search is not None else (mode == "research")
     agentic = (mode == "agent")
     r = Result()
-    # Tell the provider the shape. extract= is a caller-side callable with no renderable shape,
-    # so its prompt is left exactly as written; only schema= decorates. Done once, before the
-    # loop, so every provider in the chain and the nudge retry inside _extract_or_retry all ask
-    # for the same thing -- a chain where provider 2 is asked a different question than provider
-    # 1 is not a fallback, it is two different experiments.
+    # `timeout` is the budget for the WHOLE chain, not for each provider in it.
+    #
+    # It used to be per provider: the same value was handed to every attempt, so the worst case
+    # was timeout * len(chain). That made the parameter unusable for its only real purpose,
+    # bounding the caller's wall clock, because the caller does not choose the chain length --
+    # active_chain() reads LLMCALL_CHAIN, so an operator could double a caller's worst case by
+    # editing an environment variable the caller never sees.
+    #
+    # Measured in the wild: a daily job passed timeout=2400 expecting to wait at most 40 minutes.
+    # Its chain was two providers, both of which were hanging. It spent 08:07 to 08:47 on the
+    # first and 08:47 to 09:27 on the second, 80 minutes proving that two things were dead,
+    # and only then started the 41 minutes of actual work. Its scheduled task has a two hour
+    # execution limit, so it was killed 90 seconds before it finished writing what it had
+    # already produced.
+    deadline = time.time() + timeout
+    # Tell the provider the shape. extract= is a caller-side callable with no renderable shape, so
+    # its prompt is left exactly as written; only schema= decorates. Done once, before the loop, so
+    # every provider in the chain and the nudge retry inside _extract_or_retry all ask for the same
+    # thing -- a chain where provider 2 is asked a different question than provider 1 is not a
+    # fallback, it is two different experiments.
     ask = prompt + _schema_instruction(schema) if schema is not None and extract is None else prompt
     for name in chain:
+        remaining = deadline - time.time()
+        if remaining < _MIN_PROVIDER_BUDGET:
+            # Do not hand a provider a budget it cannot possibly do anything with. Saying so is
+            # the point: a chain that ran out of time must look different from a chain whose
+            # providers were all genuinely unavailable, or the next reader cannot tell whether
+            # to fix the providers or raise the budget.
+            _log(log, f"{name}: skipped (chain budget of {timeout:.0f}s exhausted)")
+            r.attempts.append(Attempt(name, False, 0, "chain budget exhausted"))
+            continue
         t0 = time.time()
         data = None
         try:
-            raw, err = _invoke(name, ask, timeout, model, effort, web, agentic)
+            raw, err = _invoke(name, ask, remaining, model, effort, web, agentic)
             text = (raw or "").strip()
             if text and (schema is not None or extract is not None):
                 data, verr = _extract_or_retry(name, ask, text, schema, extract,
-                                                timeout, model, effort, web, agentic)
+                                                max(deadline - time.time(), _MIN_PROVIDER_BUDGET),
+                                                model, effort, web, agentic)
                 if data is None:
                     text, err = "", verr  # unparseable / schema-invalid counts as a provider miss
         except Exception as e:  # the never-raises guarantee: a provider bug cannot escape the chain
