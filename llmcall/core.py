@@ -87,6 +87,16 @@ _MODES = ("judge", "research", "agent")
 # chain reports "budget exhausted" instead of burning the remainder on an attempt that was
 # never going to land.
 _MIN_PROVIDER_BUDGET = 15.0
+# What to hold back for EACH provider still to come. One floor is not enough: enforcing a timeout
+# overruns it slightly, so a provider handed exactly `remaining - floor` and hanging leaves less than
+# the floor behind and the next one is skipped as budget-exhausted anyway. Measured: a 75s attempt
+# took 75.9s, about 1.2%, and cc was still starved. The 25% headroom here is far more than that
+# overrun and is a fixed multiple of the floor, so scaling the floor down in tests scales this too.
+# A MULTIPLE, not a precomputed value: the reserve has to follow _MIN_PROVIDER_BUDGET at call
+# time. Computing it at import meant a test that scales the floor down left the reserve at its
+# production size, so every share went negative and every provider got the floor. Four tests
+# caught that immediately, which is the only reason this line reads the way it does.
+_RESERVE_MULTIPLE = 1.25
 
 _AGENT_RUNNER = os.path.expanduser(os.environ.get("LLMCALL_AGENT_RUNNER", "~/.llmcall/agent-runner.ps1"))
 
@@ -485,8 +495,25 @@ def call(prompt: str, *, chain=None, schema=None, extract=None, mode: str = "jud
     # thing -- a chain where provider 2 is asked a different question than provider 1 is not a
     # fallback, it is two different experiments.
     ask = prompt + _schema_instruction(schema) if schema is not None and extract is None else prompt
-    for name in chain:
+    # RESERVE for the providers behind this one; do not divide among them.
+    #
+    # Handing an attempt the whole remainder lets the first provider starve the ladder: measured
+    # against a codex launcher that accepts the call and then sits there, the chain spent the whole
+    # 90s budget on codex and reported "budget exhausted" for cc, which was never attempted. A
+    # ladder whose first rung can consume the ladder is not a fallback.
+    #
+    # Dividing evenly (remaining / providers-left) fixes that and is WRONG for the common case,
+    # which is that the first provider answers: it must get the caller full patience, not a third of
+    # it. That is not a hypothetical, it is what test_a_single_slow_provider_still_gets_the_whole
+    # _budget exists to say, and it caught exactly this over-correction.
+    #
+    # So: keep almost everything for this attempt, and hold back one floor for each provider still
+    # to come. With three providers and 90s the first gets 60s rather than 30s, and the two behind
+    # it are each still guaranteed a real turn.
+    for idx, name in enumerate(chain):
+        behind = len(chain) - idx - 1
         remaining = deadline - time.time()
+        share = remaining - behind * (_MIN_PROVIDER_BUDGET * _RESERVE_MULTIPLE)
         if remaining < _MIN_PROVIDER_BUDGET:
             # Do not hand a provider a budget it cannot possibly do anything with. Saying so is
             # the point: a chain that ran out of time must look different from a chain whose
@@ -498,7 +525,7 @@ def call(prompt: str, *, chain=None, schema=None, extract=None, mode: str = "jud
         t0 = time.time()
         data = None
         try:
-            raw, err = _invoke(name, ask, remaining, model, effort, web, agentic)
+            raw, err = _invoke(name, ask, max(share, _MIN_PROVIDER_BUDGET), model, effort, web, agentic)
             text = (raw or "").strip()
             if text and (schema is not None or extract is not None):
                 data, verr = _extract_or_retry(name, ask, text, schema, extract,

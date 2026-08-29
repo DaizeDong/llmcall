@@ -113,13 +113,29 @@ def test_a_provider_reached_with_nothing_left_is_recorded_not_silently_dropped(m
     """
     seen = []
     monkeypatch.setattr(core, "_invoke", _hanging(seen))
-    r = call("x", chain=["codex", "cc", "claude"], timeout=0.30)
 
+    # With a budget the chain can actually divide, the reserve now guarantees every provider a turn
+    # even when the first one hangs, so nothing is skipped and nothing says "exhausted". That is the
+    # newer guarantee, asserted here so the two states cannot be confused for each other.
+    r = call("x", chain=["codex", "cc", "claude"], timeout=0.30)
     assert [a.provider for a in r.attempts] == ["codex", "cc", "claude"], \
         "every provider in the chain must appear in the attempt list"
-    exhausted = [a for a in r.attempts if a.error and "budget" in a.error]
-    assert exhausted, "nothing was marked as budget exhausted: %r" % ([a.error for a in r.attempts],)
-    assert len(seen) < 3, "a provider was invoked despite there being no budget left"
+    assert len(seen) == 3, \
+        "the reserve guarantees each provider a turn, but only %r were invoked" % (seen,)
+
+    # The original point of this test stands and still needs a case of its own: a budget that CANNOT
+    # cover the chain must SAY so, rather than looking like three broken providers. Below one floor
+    # per provider there is genuinely nothing to hand out, and the skip and its wording are what tell
+    # a reader to raise the budget instead of going off to repair providers that are fine.
+    seen2 = []
+    monkeypatch.setattr(core, "_invoke", _hanging(seen2))
+    r2 = call("x", chain=["codex", "cc", "claude"], timeout=core._MIN_PROVIDER_BUDGET * 1.2)
+    assert [a.provider for a in r2.attempts] == ["codex", "cc", "claude"], \
+        "a skipped provider must still appear, or a reader cannot see that it was skipped"
+    exhausted = [a for a in r2.attempts if a.error and "budget" in a.error]
+    assert exhausted, "a budget too small for the chain said nothing about the budget: %r" \
+        % ([a.error for a in r2.attempts],)
+    assert len(seen2) < 3, "a provider was invoked despite there being no budget left"
 
 
 def test_a_single_slow_provider_still_gets_the_whole_budget(monkeypatch):
