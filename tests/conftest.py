@@ -17,14 +17,7 @@ variable is part of what is being tested.
 """
 import pytest
 
-# Every environment variable core.py consults. Keep this list in step with the module: an entry
-# missing here is a way for the host machine to change a test result without saying so.
-STEERING_VARS = (
-    "LLMCALL_CHAIN",          # which providers, in which order
-    "LLMCALL_AGENT_RUNNER",   # the external agent runner for the cc/claude agentic path
-    "LLMCALL_RELAY",          # notification relay
-    "LLMCALL_LEDGER",         # ledger destination
-)
+from steering_vars import STEERING_VARS   # noqa: E402  (shared data, see that module)
 
 
 @pytest.fixture(autouse=True)

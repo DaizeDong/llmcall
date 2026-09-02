@@ -8,7 +8,7 @@ import os
 import re
 
 import llmcall.core as core
-from conftest import STEERING_VARS
+from steering_vars import STEERING_VARS
 
 
 def test__conftest_actually_clears(monkeypatch):
