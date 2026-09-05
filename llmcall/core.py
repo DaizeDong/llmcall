@@ -68,7 +68,17 @@ _NO_MCP = ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}')
 
 _CODEX_FALLBACK_MODEL = "gpt-5.6-sol"
 _CODEX_FALLBACK_EFFORT = "xhigh"
-_CLAUDE_FALLBACK_MODEL = "claude-opus-4-8"
+# An ALIAS, not a pinned id. The CLI resolves "opus" to the newest Opus, so this follows the
+# model line instead of freezing at whatever was current the day it was written. It was pinned
+# to claude-opus-4-8, and by 2026-09-05 that meant every headless call in this fleet that fell
+# through to a Claude provider ran a model behind the one the operator uses interactively.
+# Nothing announced the downgrade: both ids resolve and answer, so the only way to see it was
+# to read modelUsage in the JSON envelope.
+#
+# Measured 2026-09-05: --model opus resolves to claude-opus-5; --model claude-opus-4-8 resolves
+# to claude-opus-4-8. Both answer, and that is the point: a pin does not fail, it just quietly
+# stops keeping up.
+_CLAUDE_FALLBACK_MODEL = "opus"
 _GEMINI_FALLBACK_MODEL = "gemini-3-pro-preview"
 
 # Opt-in web tools. web_search=True relaxes the read-only default: codex gains the web_search tool
